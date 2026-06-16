@@ -6,16 +6,36 @@ requires-python = ">=3.12"
 dependencies = [
     "langchain>=0.3",
     "langgraph>=0.2",
+    "langserve[server]>=0.3",
     "langsmith>=0.1",
+    "langchain-community>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-chroma>=0.2",
+    "langchain-milvus>=0.1",
     "pydantic-settings>=2.0",
     "jinja2>=3.1",
+    "pymupdf>=1.24",
+    "python-docx>=1.1",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
     "redis>=5.0",
     "sqlalchemy[asyncio]>=2.0",
+    "asyncmy>=0.2",
+    "docker>=7.0",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
     "fastapi>=0.111",
     "uvicorn>=0.30",
+    "rank-bm25>=0.2.2",
     "chardet>=5.0",
+]
+
+[project.optional-dependencies]
+ml = [
+    "sentence-transformers>=3.0",
+    "FlagEmbedding>=1.2",
+    "unstructured[all-docs]>=0.15",
 ]
 
 [project.optional-dependencies]
