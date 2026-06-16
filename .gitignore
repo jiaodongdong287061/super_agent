@@ -1,0 +1,14 @@
+__pycache__/
+*.py[oc]
+*.pyc
+.env
+.env.local
+.venv/
+dist/
+*.egg-info/
+data/chroma/
+data/processed/
+.ruff_cache/
+.pytest_cache/
+build/
+wheels/
