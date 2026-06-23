@@ -52,6 +52,9 @@ class ExcelLoader(BaseLoader):
         if sheet.max_row is None or sheet.max_row < 1:
             return []
 
+        # 合并单元格填充
+        self._fill_merged_cells(sheet)
+
         # 读取所有行
         all_rows: list[list[str]] = []
         for row in sheet.iter_rows(min_row=1, max_row=sheet.max_row, values_only=True):
@@ -96,6 +99,21 @@ class ExcelLoader(BaseLoader):
 
         sheet_name = sheet.title
         return self._chunk_sheet(headers, data_rows, file_name, sheet_name)
+
+    def _fill_merged_cells(self, sheet) -> None:
+        """将合并单元格的值向下填充到所有被合并的行，然后取消合并。"""
+        if not sheet.merged_cells.ranges:
+            return
+        ranges = list(sheet.merged_cells.ranges)
+        for mr in ranges:
+            top_value = sheet.cell(row=mr.min_row, column=mr.min_col).value
+            if top_value is None:
+                top_value = ""
+            # 先取消合并（使其可写），再填充值
+            sheet.unmerge_cells(str(mr))
+            for row_idx in range(mr.min_row, mr.max_row + 1):
+                for col_idx in range(mr.min_col, mr.max_col + 1):
+                    sheet.cell(row=row_idx, column=col_idx, value=top_value)
 
     def _load_xls(self, source: str) -> list[Document]:
         import xlrd

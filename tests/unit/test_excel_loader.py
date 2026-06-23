@@ -60,3 +60,35 @@ class TestExcelLoaderXlsxSingleSheet:
         loader = ExcelLoader()
         assert ".xlsx" in loader.supported_extensions()
         assert ".xls" in loader.supported_extensions()
+
+
+class TestExcelLoaderMergedCells:
+    def test_merged_cell_fill_down(self, tmp_path):
+        """合并单元格：左上角的值应填充到所有被合并的行。"""
+        from openpyxl import Workbook
+        from openpyxl.utils import get_column_letter
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "合并测试"
+        ws.append(["系统", "指标", "值"])
+        # 合并 A2:A4（系统列前 3 行数据）
+        ws.append(["生产环境", "CPU", "80%"])
+        ws.append([None, "内存", "60%"])
+        ws.append([None, "磁盘", "50%"])
+        ws.append(["测试环境", "CPU", "30%"])
+        ws.merge_cells("A2:A4")
+
+        p = tmp_path / "merged.xlsx"
+        wb.save(str(p))
+
+        loader = ExcelLoader()
+        docs = loader.load(str(p))
+        text = docs[0].page_content
+        # 合并填充后，A2-A4 都应为 "生产环境"
+        assert text.count("系统: 生产环境") == 3
+        assert "系统: 测试环境" in text
+
+    def test_no_merge_in_xls(self, tmp_path):
+        """xls 不支持合并填充，空值保留为空。"""
+        pass
