@@ -92,3 +92,49 @@ class TestExcelLoaderMergedCells:
     def test_no_merge_in_xls(self, tmp_path):
         """xls 不支持合并填充，空值保留为空。"""
         pass
+
+
+class TestExcelLoaderChunking:
+    def test_chunk_size_splits_rows(self, tmp_path):
+        """超过 chunk_size 的数据行应拆分为多个 Document。"""
+        headers = ["ID", "名称"]
+        rows = [[str(i), f"项目{i}"] for i in range(1, 26)]  # 25 行数据
+        p = _make_xlsx(tmp_path, rows, headers)
+        loader = ExcelLoader(chunk_size=10, chunk_overlap=0)
+        docs = loader.load(str(p))
+        assert len(docs) == 3  # 10 + 10 + 5
+        assert "1-10" in docs[0].metadata["row_range"]
+        assert "11-20" in docs[1].metadata["row_range"]
+        assert "21-25" in docs[2].metadata["row_range"]
+
+    def test_chunk_overlap(self, tmp_path):
+        """相邻 chunk 应有重叠行。"""
+        headers = ["ID", "名称"]
+        rows = [[str(i), f"项目{i}"] for i in range(1, 26)]  # 25 行数据
+        p = _make_xlsx(tmp_path, rows, headers)
+        loader = ExcelLoader(chunk_size=10, chunk_overlap=3)
+        docs = loader.load(str(p))
+        # step = 10 - 3 = 7; chunks: [0:10], [7:17], [14:24], [21:25]
+        assert len(docs) == 4
+        # 验证重叠：chunk1 第一个数据行应包含 chunk0 倒数第3行的数据
+        assert "8" in docs[1].page_content  # row 8 出现在 chunk1
+
+    def test_small_data_single_chunk(self, tmp_path):
+        """数据行不足 chunk_size 时生成单个 chunk。"""
+        headers = ["ID"]
+        rows = [["1"], ["2"]]
+        p = _make_xlsx(tmp_path, rows, headers)
+        loader = ExcelLoader(chunk_size=20, chunk_overlap=3)
+        docs = loader.load(str(p))
+        assert len(docs) == 1
+        assert "1-2" in docs[0].metadata["row_range"]
+
+    def test_each_chunk_contains_header(self, tmp_path):
+        """每个 chunk 都应包含表头部分。"""
+        headers = ["ID", "名称"]
+        rows = [[str(i), f"项目{i}"] for i in range(1, 26)]
+        p = _make_xlsx(tmp_path, rows, headers)
+        loader = ExcelLoader(chunk_size=10, chunk_overlap=0)
+        docs = loader.load(str(p))
+        for doc in docs:
+            assert "[表头]" in doc.page_content
