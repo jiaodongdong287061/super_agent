@@ -138,3 +138,54 @@ class TestExcelLoaderChunking:
         docs = loader.load(str(p))
         for doc in docs:
             assert "[表头]" in doc.page_content
+
+
+class TestExcelLoaderMultiSheet:
+    def test_multiple_sheets(self, tmp_path):
+        """每个 sheet 独立生成 Document。"""
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws1 = wb.active
+        ws1.title = "员工"
+        ws1.append(["姓名", "部门"])
+        ws1.append(["张三", "SRE"])
+
+        ws2 = wb.create_sheet("服务器")
+        ws2.append(["主机名", "IP"])
+        ws2.append(["web01", "10.0.0.1"])
+
+        p = tmp_path / "multi.xlsx"
+        wb.save(str(p))
+
+        loader = ExcelLoader()
+        docs = loader.load(str(p))
+        assert len(docs) == 2
+        sheet_names = [d.metadata["sheet_name"] for d in docs]
+        assert "员工" in sheet_names
+        assert "服务器" in sheet_names
+
+    def test_empty_sheet_skipped(self, tmp_path):
+        """空 sheet 或只有表头无数据的 sheet 应跳过。"""
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws1 = wb.active
+        ws1.title = "有数据"
+        ws1.append(["姓名"])
+        ws1.append(["张三"])
+
+        ws2 = wb.create_sheet("空表")
+        ws2.append(["姓名"])
+        # 无数据行
+
+        ws3 = wb.create_sheet("完全空")
+        # 无任何内容
+
+        p = tmp_path / "mixed.xlsx"
+        wb.save(str(p))
+
+        loader = ExcelLoader()
+        docs = loader.load(str(p))
+        assert len(docs) == 1
+        assert docs[0].metadata["sheet_name"] == "有数据"
