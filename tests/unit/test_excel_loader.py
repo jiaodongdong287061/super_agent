@@ -189,3 +189,49 @@ class TestExcelLoaderMultiSheet:
         docs = loader.load(str(p))
         assert len(docs) == 1
         assert docs[0].metadata["sheet_name"] == "有数据"
+
+
+class TestExcelLoaderXls:
+    def test_load_xls_file(self, tmp_path):
+        """xls 文件可正常加载。"""
+        import xlwt
+
+        wb = xlwt.Workbook()
+        ws = wb.add_sheet("数据")
+        ws.write(0, 0, "主机名")
+        ws.write(0, 1, "IP")
+        ws.write(1, 0, "web01")
+        ws.write(1, 1, "10.0.0.1")
+
+        p = tmp_path / "test.xls"
+        wb.save(str(p))
+
+        loader = ExcelLoader()
+        docs = loader.load(str(p))
+        assert len(docs) >= 1
+        assert "主机名: 主机名" in docs[0].page_content
+        assert "主机名: web01" in docs[0].page_content
+        assert docs[0].metadata["sheet_name"] == "数据"
+
+    def test_xls_no_merge_support(self, tmp_path):
+        """xls 不支持合并单元格填充，空值不出现键值对。"""
+        import xlwt
+
+        wb = xlwt.Workbook()
+        ws = wb.add_sheet("合并")
+        ws.write(0, 0, "系统")
+        ws.write(0, 1, "指标")
+        ws.write(1, 0, "生产环境")
+        ws.write(1, 1, "CPU")
+        # 第 2 行系统列留空（模拟合并后的空值）
+        ws.write(2, 1, "内存")
+
+        p = tmp_path / "nomerge.xls"
+        wb.save(str(p))
+
+        loader = ExcelLoader()
+        docs = loader.load(str(p))
+        text = docs[0].page_content
+        # 空值不应生成 "系统: " 键值对（空列跳过逻辑）
+        data_section = text.split("[数据行")[1]
+        assert "系统:" not in data_section or "系统: 生产环境" in text
