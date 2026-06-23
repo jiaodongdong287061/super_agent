@@ -235,3 +235,65 @@ class TestExcelLoaderXls:
         # 空值不应生成 "系统: " 键值对（空列跳过逻辑）
         data_section = text.split("[数据行")[1]
         assert "系统:" not in data_section or "系统: 生产环境" in text
+
+
+class TestExcelLoaderRegistry:
+    def test_get_loader_xlsx(self):
+        from super_agent.knowledge.loaders import get_loader
+
+        loader = get_loader(".xlsx")
+        assert isinstance(loader, ExcelLoader)
+
+    def test_get_loader_xls(self):
+        from super_agent.knowledge.loaders import get_loader
+
+        loader = get_loader(".xls")
+        assert isinstance(loader, ExcelLoader)
+
+
+class TestExcelLoaderEdgeCases:
+    def test_invalid_chunk_size(self):
+        with pytest.raises(ValueError, match="chunk_size"):
+            ExcelLoader(chunk_size=0)
+
+    def test_overlap_exceeds_size(self):
+        with pytest.raises(ValueError, match="chunk_overlap"):
+            ExcelLoader(chunk_size=5, chunk_overlap=5)
+
+    def test_empty_columns_skipped(self, tmp_path):
+        """全空列不出现在输出中。"""
+        headers = ["名称", "备注", "状态"]
+        rows = [["服务A", "", "运行中"]]
+        p = _make_xlsx(tmp_path, rows, headers)
+        loader = ExcelLoader()
+        docs = loader.load(str(p))
+        text = docs[0].page_content
+        # "备注" 列在数据行中值为空，不应生成 "备注: " 键值对
+        data_section = text.split("[数据行")[1]
+        assert "备注:" not in data_section
+
+    def test_unsupported_extension(self, tmp_path):
+        p = tmp_path / "test.txt"
+        p.write_text("hello", encoding="utf-8")
+        loader = ExcelLoader()
+        with pytest.raises(ValueError, match="Unsupported"):
+            loader.load(str(p))
+
+    def test_numeric_cell_values(self, tmp_path):
+        """数值型单元格应转为字符串。"""
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["指标", "值"])
+        ws.append(["CPU", 0.85])
+        ws.append(["内存", 1024])
+
+        p = tmp_path / "numeric.xlsx"
+        wb.save(str(p))
+
+        loader = ExcelLoader()
+        docs = loader.load(str(p))
+        text = docs[0].page_content
+        assert "值: 0.85" in text
+        assert "值: 1024" in text
