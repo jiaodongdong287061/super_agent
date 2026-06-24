@@ -5,6 +5,7 @@ from super_agent.knowledge.loaders.markdown import MarkdownLoader
 from super_agent.knowledge.loaders.html import HTMLLoader
 from super_agent.knowledge.loaders.structured import JSONLoader, YAMLLoader, CSVLoader
 from super_agent.knowledge.loaders.excel import ExcelLoader
+from super_agent.knowledge.loaders.ppt import PPTLoader
 
 _REGISTRY: dict[str, type[BaseLoader]] = {}
 
@@ -22,6 +23,7 @@ _register(JSONLoader)
 _register(YAMLLoader)
 _register(CSVLoader)
 _register(ExcelLoader)
+_register(PPTLoader)
 
 
 def get_loader(extension: str) -> BaseLoader:

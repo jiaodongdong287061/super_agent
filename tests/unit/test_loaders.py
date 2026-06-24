@@ -118,3 +118,63 @@ class TestExcelLoaderNoTopicTags:
         docs = loader.load(str(f))
         assert len(docs) > 0
         assert "topic_tags" not in docs[0].metadata
+
+
+class TestPPTLoader:
+    def test_pptx_extension_registered(self):
+        loader = get_loader(".pptx")
+        assert loader is not None
+        assert ".pptx" in loader.supported_extensions()
+
+    def test_ppt_extension_registered(self):
+        loader = get_loader(".ppt")
+        assert loader is not None
+        assert ".ppt" in loader.supported_extensions()
+
+    def test_load_pptx_sample(self, tmp_path):
+        """用 python-pptx 构造一个最小 pptx 文件并加载"""
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+
+        prs = Presentation()
+        slide_layout = prs.slide_layouts[1]  # Title and Content
+        slide = prs.slides.add_slide(slide_layout)
+        slide.shapes.title.text = "测试标题"
+        body = slide.placeholders[1]
+        body.text = "测试正文内容"
+
+        f = tmp_path / "test.pptx"
+        prs.save(str(f))
+
+        from super_agent.knowledge.loaders.ppt import PPTLoader
+
+        loader = PPTLoader()
+        docs = loader.load(str(f))
+        assert len(docs) == 1
+        assert "测试标题" in docs[0].page_content
+        assert "测试正文内容" in docs[0].page_content
+
+    def test_pptx_metadata(self, tmp_path):
+        from pptx import Presentation
+
+        prs = Presentation()
+        slide_layout = prs.slide_layouts[1]
+        slide = prs.slides.add_slide(slide_layout)
+        slide.shapes.title.text = "标题"
+
+        f = tmp_path / "test.pptx"
+        prs.save(str(f))
+
+        from super_agent.knowledge.loaders.ppt import PPTLoader
+
+        loader = PPTLoader()
+        docs = loader.load(str(f))
+        assert len(docs) == 1
+        meta = docs[0].metadata
+        assert meta["source"] == str(f)
+        assert meta["slide_number"] == 1
+        assert meta["total_slides"] == 1
+        assert "has_notes" in meta
+        assert "has_tables" in meta
+        assert "has_images" in meta
+        assert "ocr_used" in meta
