@@ -178,3 +178,87 @@ class TestPPTLoader:
         assert "has_tables" in meta
         assert "has_images" in meta
         assert "ocr_used" in meta
+
+    def test_multiple_slides(self, tmp_path):
+        """多张幻灯片各产出 1 个 Document"""
+        from pptx import Presentation
+
+        prs = Presentation()
+        for i in range(3):
+            slide_layout = prs.slide_layouts[1]
+            slide = prs.slides.add_slide(slide_layout)
+            slide.shapes.title.text = f"第{i + 1}页"
+            body = slide.placeholders[1]
+            body.text = f"内容{i + 1}"
+
+        f = tmp_path / "multi.pptx"
+        prs.save(str(f))
+
+        from super_agent.knowledge.loaders.ppt import PPTLoader
+
+        loader = PPTLoader()
+        docs = loader.load(str(f))
+        assert len(docs) == 3
+        assert docs[0].metadata["slide_number"] == 1
+        assert docs[1].metadata["slide_number"] == 2
+        assert docs[2].metadata["slide_number"] == 3
+        assert docs[0].metadata["total_slides"] == 3
+
+    def test_table_extraction(self, tmp_path):
+        """表格提取为 Markdown 格式"""
+        from pptx import Presentation
+        from pptx.util import Inches
+
+        prs = Presentation()
+        slide_layout = prs.slide_layouts[5]  # Blank
+        slide = prs.slides.add_slide(slide_layout)
+
+        rows, cols = 2, 2
+        table_shape = slide.shapes.add_table(rows, cols, Inches(1), Inches(1), Inches(4), Inches(2))
+        table = table_shape.table
+        table.cell(0, 0).text = "名称"
+        table.cell(0, 1).text = "值"
+        table.cell(1, 0).text = "CPU"
+        table.cell(1, 1).text = "90%"
+
+        f = tmp_path / "table.pptx"
+        prs.save(str(f))
+
+        from super_agent.knowledge.loaders.ppt import PPTLoader
+
+        loader = PPTLoader()
+        docs = loader.load(str(f))
+        assert len(docs) == 1
+        assert "|" in docs[0].page_content
+        assert "CPU" in docs[0].page_content
+        assert docs[0].metadata["has_tables"] is True
+
+    def test_notes_extraction(self, tmp_path):
+        """演讲者备注以 [备注] 前缀提取"""
+        from pptx import Presentation
+
+        prs = Presentation()
+        slide_layout = prs.slide_layouts[1]
+        slide = prs.slides.add_slide(slide_layout)
+        slide.shapes.title.text = "标题"
+        notes_slide = slide.notes_slide
+        notes_slide.notes_text_frame.text = "这是备注内容"
+
+        f = tmp_path / "notes.pptx"
+        prs.save(str(f))
+
+        from super_agent.knowledge.loaders.ppt import PPTLoader
+
+        loader = PPTLoader()
+        docs = loader.load(str(f))
+        assert len(docs) == 1
+        assert "[备注]" in docs[0].page_content
+        assert "这是备注内容" in docs[0].page_content
+        assert docs[0].metadata["has_notes"] is True
+
+    def test_unsupported_extension_raises(self):
+        from super_agent.knowledge.loaders.ppt import PPTLoader
+
+        loader = PPTLoader()
+        with pytest.raises(ValueError, match="Unsupported extension"):
+            loader.load("test.txt")
