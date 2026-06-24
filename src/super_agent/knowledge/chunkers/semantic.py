@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import uuid
-from pathlib import Path
 
 from langchain_core.documents import Document
 
