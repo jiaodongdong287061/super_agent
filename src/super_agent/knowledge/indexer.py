@@ -8,6 +8,7 @@ from super_agent.knowledge.stores.base import BaseVectorStore
 from super_agent.knowledge.embedders.base import BaseEmbedder
 from super_agent.knowledge.chunkers.base import BaseChunker
 from super_agent.knowledge.loaders import get_loader, supported_extensions
+from super_agent.knowledge.tags import parse_tags_yaml, match_file_tags
 
 
 class Indexer:
@@ -29,8 +30,14 @@ class Indexer:
         doc_path = Path(doc_dir)
         state = self._load_state()
 
+        # 自动检测 tags.yaml
+        tags_yaml_path = doc_path / "tags.yaml"
+        yaml_tags = parse_tags_yaml(tags_yaml_path)
+
         for fp in doc_path.rglob("*"):
             if not fp.is_file() or fp.suffix.lower() not in supported_extensions():
+                continue
+            if fp.name == "tags.yaml":
                 continue
 
             file_hash = self._file_hash(fp)
@@ -42,10 +49,15 @@ class Indexer:
             loader = get_loader(fp.suffix.lower())
             documents = loader.load(str(fp))
 
-            # 将自定义标签写入每个 Document 的 metadata
-            tags = file_tags.get(str(fp), []) if file_tags else []
+            # 合并: 调用方 file_tags + tags.yaml 匹配
+            manual_tags = file_tags.get(str(fp), []) if file_tags else []
+            # 规范化路径为正斜杠以匹配 tags.yaml 中的键
+            norm_path = str(fp).replace("\\", "/")
+            yaml_matched = match_file_tags(norm_path, yaml_tags)
+            merged = manual_tags + [t for t in yaml_matched if t not in manual_tags]
+
             for doc in documents:
-                doc.metadata["manual_tags"] = tags
+                doc.metadata["manual_tags"] = merged
 
             chunks = self.chunker.chunk(documents, **kwargs)
 
