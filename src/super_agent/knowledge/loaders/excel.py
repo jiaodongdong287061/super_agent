@@ -47,8 +47,6 @@ class ExcelLoader(BaseLoader):
         return docs
 
     def _process_xlsx_sheet(self, sheet, file_name: str) -> list[Document]:
-        from openpyxl.utils import get_column_letter
-
         if sheet.max_row is None or sheet.max_row < 1:
             return []
 
@@ -199,7 +197,6 @@ class ExcelLoader(BaseLoader):
                 "sheet_name": sheet_name,
                 "row_range": f"{row_start}-{row_end}",
                 "headers": headers,
-                "topic_tags": [],
             }
             docs.append(Document(page_content=page_content, metadata=meta))
             pos += step
