@@ -1,0 +1,74 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      - chroma
+      - redis
+      - mysql
+      - oneapi
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./skills:/app/skills
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  chroma:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${SA_MYSQL_PASSWORD:-devpassword}
+      MYSQL_DATABASE: super_agent
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./deploy/docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+
+  oneapi:
+    image: justsong/one-api:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - oneapi-data:/data
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT__SERVICE__API_KEY: ${SA_VECTOR_QDRANT_API_KEY:-}
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  chroma-data:
+  mysql-data:
+  oneapi-data:
+  qdrant-data:

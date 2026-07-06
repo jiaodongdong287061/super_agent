@@ -1,0 +1,135 @@
+1: 将充值记录和扣费表分开 最主要是因为扣费表的数据膨胀速度会很快；
+2：源码中训练任务是先存储，然后每一秒扫描一次，做任务ymal发布；
+3: 一期资源的计费都是强占用关系；计费也是分配后定时扣费；
+4：新增产品表，表示某种型号机的配置，用户在购买时，直接选择；
+
+
+cost对外提供服务：
+	MCostStrategyClient
+	
+	
+0、平台资源初始化										cb
+1、计费规则（资源类型字典表，使用现有的字典表,计费单位也使用字典表）			jdd
+2、计费策略												jdd
+3、产品(规格)信息										jdd
+4、用户组设置组管理员(组管理员才能申请资源、充值)		add
+5、组用户申请充值										cb
+6、管理员处理组用户的充值申请							cb
+4、组用户申请产品										cb
+5、管理员处理组用户申请的产品(K8+Slurm)					cb
+6、K8+Slurm计费处理										jdd
+7、平台资源统计											
+8、组用户申请的资源统计
+9、组用户计费列表及详情查询
+10、客户使用K8 在自己的namespace 进行任务调度			
+11、训练数据集管理
+12、镜像管理
+13、训练任务管理
+14、模型管理
+
+
+
+
+
+资源规格表：
+	
+	
+	
+	
+	具体资源类型(字典cal_resource_type的选项值)
+	类型(1:cpu 2:内存 3：gpu 4：磁盘)
+	
+规格类型：
+	字典名称：cal_resource_type
+	字典详情：
+		label		value
+		cpu-XXX		100-199枚举
+		gpu-XXX		100-299枚举
+	
+计费任务扫描用户账户余额表计算费用；
+
+
+
+
+一款产品规格 是一种类型GPU资源的虚拟机（MIG拆分），多款产品则是不同类型GPU资源的虚拟机；
+用户购买某一类型产品时，则在该集群上创建该类型GPU资源的namespace，创建时，指定GPU类型； 购买多款产品类型时，则一个人有多个namespace；
+用户执行任务时，先选择需要的产品规格，再选择资源规格；产品规格能够确定在哪个k8集群上的哪个namespace下执行任务，资源规格能够确定pod运行时使用的资源；
+
+用户产品型号在pod调用时，才能指定；
+namespace 可以指定不同类型gpu的最大限制值；
+
+尧哥说的标签 可能是为了区分统计，实际上调度还是通过pod指定资源类型及数量的
+
+
+pod调度：
+自动调度： 由 scheduler 组件计算运行在哪个node节点上
+定向调度： 由用户自定义，需要用到 NodeName、NodeSelector  属性，NodeSelector 根据标签调度
+亲和性调度： 由用户自定义，需要用到 NodeAffinity、PodAffinity、PodAntiAffinity 属性
+污点容忍调度： 由用户自定义，需要用到 Taints、Toleration属性
+
+
+
+
+
+同一个账户在一个集群上有多个namespace功能调整：
+1)创建namespace接口调整；(将同一个用户组下各个用户在同一个namespace下占用的资源情况放到label中，需要做同步处理，根据groupid 产品规格id)
+2)创建训练任务获取namespace功能调整(需要前端支持选择产品规格)；
+3)其他场景获取namespace功能调整，共有17处使用，涉及到的服务有k8s、data、notebook、point-cloud、train；
+	调整方案一：
+		保留原来给每个用户创建namespace的逻辑，只是在创建namespace时，给每个用户创建个namespace即可。后续涉及到具体业务再做用户组-集群-产品的改动；
+	调整方案二：
+		所有的地方全部支持用户组-集群-产品的namespace,需要花大量时间考究具体的业务，有的地方可能都没法渗透到集群和产品属性，故不建议；
+		
+	
+	内存 、 cpu 可以为小数  gpu只能为整数
+	
+	requests.nvidia.com/gpu-2-6-6
+		
+	开发+自测联调2-3个工作日；	
+	
+	
+	1)label 属性是否能加到namespace里（加多个用户的私有化数据）？
+	2)能否根据label过滤namespace?
+	3)能否将label属性能否加到普罗米修斯指标里去？
+	
+	
+	设计gpu的字典
+	A100-MIG 7G.80GB	requests.nvidia.com/mig-7g.80gb
+	A100-MIG 4G.40GB	requests.nvidia.com/mig-4g.40gb
+	A100-MIG 3G.40GB	requests.nvidia.com/mig-3g.40gb
+	A100-MIG 2G.20GB	requests.nvidia.com/mig-2g.20gb
+	A100-MIG 1G.20GB	requests.nvidia.com/mig-1g.20gb
+	A100-MIG 1G.10GB	requests.nvidia.com/mig-1g.10gb
+	A100-MIG 1G.10GBM	requests.nvidia.com/mig-1g.10gb+me
+	A100-MIG 8G.80GB	requests.nvidia.com/gpu
+	
+	
+	H100-MIG 7G.80GB	requests.nvidia.com/mig-7g.80gb
+	H100-MIG 4G.40GB	requests.nvidia.com/mig-4g.40gb
+	H100-MIG 3G.40GB	requests.nvidia.com/mig-3g.40gb
+	H100-MIG 2G.20GB	requests.nvidia.com/mig-2g.20gb
+	H100-MIG 1G.20GB	requests.nvidia.com/mig-1g.20gb
+	H100-MIG 1G.10GB	requests.nvidia.com/mig-1g.10gb
+	H100-MIG 1G.10GBM	requests.nvidia.com/mig-1g.10gb+me
+	H100-MIG 8G.80GB	requests.nvidia.com/gpu
+	
+	1g.10gb, 1g.10gb+me, 1g.20gb, 2g.20gb, 3g.40gb, 4g.40gb, 7g.80gb
+	
+	1 cpu 2 gpu  3 内存 4 存储  5网络
+	
+	1、计费策略新建时，直接隐藏状态下拉，后台设置状态为待发布；
+	2、计费策略编辑为禁用、启用后，其绑定计费规则按钮都要隐藏掉，只可以禁用启用计费策略；
+	3、新增产品规格时，直接隐藏状态下拉，后台设置状态为待发布；
+	4、编辑产品规格为禁用、启用后，则不可以再编辑，只可以禁用启用；
+	5、新建计费规则时，直接隐藏状态下拉，后台设置状态为待发布；
+	6、编辑计费规则为禁用、启用后，则不可以再编辑，只可以禁用启用；
+	7、将默认策略编辑为非默认策略后，需要通过编辑接口指定新的默认策略；
+	8、新建计费规则，需要指定资源类型字典；
+	9、新增账户绑定默认计费策略时，添加启用判断条件；
+	
+	
+	
+	
+	待完善功能：
+	1)镜像市场可以授权给普通用户
+	

@@ -26,12 +26,15 @@ def parse_tags_yaml(tags_file: Path) -> dict[str, list[str]]:
 
 def match_file_tags(file_path: str, file_tags: dict[str, list[str]]) -> list[str]:
     """匹配文件路径到标签。精确匹配优先于 glob 匹配。"""
-    # 精确匹配
+    # 精确匹配（优先完整路径，再试纯文件名）
     if file_path in file_tags:
         return file_tags[file_path]
 
-    # glob 匹配（按 key 顺序，返回第一个匹配）
     filename = Path(file_path).name
+    if filename in file_tags:
+        return file_tags[filename]
+
+    # glob 匹配（按 key 顺序，返回第一个匹配）
     for pattern, tags in file_tags.items():
         if "*" in pattern or "?" in pattern:
             if fnmatch.fnmatch(filename, pattern) or fnmatch.fnmatch(file_path, pattern):

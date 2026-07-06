@@ -1,0 +1,24 @@
+# tags.yaml — 文件自定义标签配置
+#
+# 放在 doc_dir（传给 Indexer.build 的文档目录）根下，Indexer 构建时自动检测。
+#
+# 格式：key 为文件相对路径或 glob 模式，value 为标签列表。
+# 匹配优先级：精确路径 > glob 模式。
+#
+# 标签合并顺序：file_tags（代码传入）→ tags.yaml 匹配 → 路径目录自动继承
+# 三者互补去重，manual_tags 在前。
+
+# --- 精确路径匹配 ---
+"路线.docx": ["路线"]
+"2-高性能MySQL（第3版).pdf": ["mysql"]
+"算力调度管理平台研发规划-加NV支持页.pptx": ["算力调度"]
+"slurm部署及命令.pdf": ["slurm"]
+
+# --- glob 模式匹配 ---
+"*.pptx": ["pptx"]
+"*.xlsx": ["xlsx"]
+"*.markdown": ["markdown"]
+"*.pdf": ["pdf"]
+"*.docx": ["docx"]
+"*.md": ["md"]
+"*.txt": ["txt"]

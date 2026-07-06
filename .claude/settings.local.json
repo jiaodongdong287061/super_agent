@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv init *)",
+      "Bash(uv sync *)",
+      "Bash(uv run *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(docker compose *)",
+      "Bash(ls .venv/Scripts/python.exe)",
+      "Bash(.venv/Scripts/python.exe -c \"import super_agent; print\\('ok'\\)\")",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/unit/test_config.py -v)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/unit/test_loaders.py -v)",
+      "Bash(uv add *)",
+      "Bash(python -m pytest tests/unit/test_metadata.py::test_resolve_topic_tags_merge_manual_and_inherited tests/unit/test_metadata.py::test_resolve_topic_tags_dedup tests/unit/test_metadata.py::test_resolve_topic_tags_empty_path tests/unit/test_metadata.py::test_resolve_topic_tags_no_manual tests/unit/test_metadata.py::test_resolve_topic_tags_none_manual -v)",
+      "Bash(python -m pytest tests/unit/test_metadata.py -v)",
+      "Bash(python -m pytest tests/unit/test_chunkers.py::test_chunk_carries_manual_tags -v)",
+      "Bash(python -m pytest tests/unit/test_chunkers.py -v)",
+      "Bash(python -m pytest tests/unit/test_loaders.py::TestExcelLoaderNoTopicTags -v)",
+      "Bash(python -m pytest tests/unit/test_loaders.py -v)",
+      "Bash(python *)",
+      "Bash(git *)",
+      "Bash(uv --version)"
+    ]
+  }
+}

@@ -36,6 +36,7 @@ dependencies = [
     "openpyxl>=3.1",
     "xlrd>=2.0",
     "python-pptx>=0.6.21",
+    "prometheus-client>=0.19",
 ]
 
 [project.optional-dependencies]

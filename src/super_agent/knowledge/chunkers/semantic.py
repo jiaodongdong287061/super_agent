@@ -13,12 +13,12 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？\.\!\?])\s*")
 
 
-def _split_sentences(text: str) -> list[str]:
+def split_sentences(text: str) -> list[str]:
     parts = _SENTENCE_SPLIT_RE.split(text)
     return [p.strip() for p in parts if p.strip()]
 
 
-def _estimate_tokens(text: str) -> int:
+def estimate_tokens(text: str) -> int:
     chinese = sum(1 for c in text if "一" <= c <= "鿿")
     others = len(text) - chinese
     return chinese + others // 4
@@ -48,7 +48,7 @@ class SemanticChunker(BaseChunker):
             content = content.strip()
             if not content:
                 continue
-            tokens = _estimate_tokens(content)
+            tokens = estimate_tokens(content)
             if tokens <= max_chunk_size:
                 chunks.append(self._make_chunk(content, heading_chain, source, doc.metadata))
             else:
@@ -94,7 +94,7 @@ class SemanticChunker(BaseChunker):
         max_chunk_size: int,
         overlap_ratio: float | None,
     ) -> list[Chunk]:
-        sentences = _split_sentences(content)
+        sentences = split_sentences(content)
         ratio = self.resolve_overlap_ratio("text", overlap_ratio)
         overlap_tokens = int(max_chunk_size * ratio)
 
@@ -104,7 +104,7 @@ class SemanticChunker(BaseChunker):
         overlap_sentences: list[str] = []
 
         for sent in sentences:
-            sent_tokens = _estimate_tokens(sent)
+            sent_tokens = estimate_tokens(sent)
             if current_tokens + sent_tokens > max_chunk_size and current_sentences:
                 chunk_text = " ".join(current_sentences)
                 c = self._make_chunk(chunk_text, heading_chain, source, doc_meta)
@@ -117,7 +117,7 @@ class SemanticChunker(BaseChunker):
                 overlap_sentences = []
                 overlap_count = 0
                 for s in reversed(current_sentences):
-                    st = _estimate_tokens(s)
+                    st = estimate_tokens(s)
                     if overlap_count + st > overlap_target:
                         break
                     overlap_sentences.insert(0, s)
@@ -125,7 +125,7 @@ class SemanticChunker(BaseChunker):
                 current_sentences = list(overlap_sentences)
                 current_tokens = overlap_count
             current_sentences.append(sent)
-            current_tokens += _estimate_tokens(sent)
+            current_tokens += estimate_tokens(sent)
 
         if current_sentences:
             chunk_text = " ".join(current_sentences)

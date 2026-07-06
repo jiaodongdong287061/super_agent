@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 
 from super_agent.knowledge.stores.base import BaseVectorStore
@@ -30,7 +31,6 @@ class Indexer:
         doc_path = Path(doc_dir)
         state = self._load_state()
 
-        # 自动检测 tags.yaml
         tags_yaml_path = doc_path / "tags.yaml"
         yaml_tags = parse_tags_yaml(tags_yaml_path)
 
@@ -43,21 +43,25 @@ class Indexer:
             file_hash = self._file_hash(fp)
             rel_path = str(fp)
 
-            if state.get(rel_path) == file_hash:
+            old_state = state.get(rel_path)
+            if old_state and old_state.get("hash") == file_hash:
                 continue
 
             loader = get_loader(fp.suffix.lower())
             documents = loader.load(str(fp))
 
-            # 合并: 调用方 file_tags + tags.yaml 匹配
             manual_tags = file_tags.get(str(fp), []) if file_tags else []
-            # 规范化路径为正斜杠以匹配 tags.yaml 中的键
             norm_path = str(fp).replace("\\", "/")
             yaml_matched = match_file_tags(norm_path, yaml_tags)
             merged = manual_tags + [t for t in yaml_matched if t not in manual_tags]
 
+            # Version tracking: increment if file changed
+            old_version = old_state.get("version", "0") if old_state else "0"
+            new_version = str(int(old_version) + 1) if old_state and old_state.get("hash") != file_hash else old_version
+
             for doc in documents:
                 doc.metadata["manual_tags"] = merged
+                doc.metadata["doc_version"] = new_version
 
             chunks = self.chunker.chunk(documents, **kwargs)
 
@@ -66,7 +70,11 @@ class Indexer:
                 embeddings = self.embedder.embed_texts(texts)
                 self.store.add(chunks, embeddings)
 
-            state[rel_path] = file_hash
+            state[rel_path] = {
+                "hash": file_hash,
+                "version": new_version,
+                "last_indexed": datetime.now().isoformat(),
+            }
             self._save_state(state)
 
     def rebuild(self, doc_dir: str, **kwargs) -> None:
@@ -74,6 +82,30 @@ class Indexer:
         if self.state_file.exists():
             self.state_file.unlink()
         self.build(doc_dir, **kwargs)
+
+    def get_document_status(self, doc_path: str) -> dict | None:
+        state = self._load_state()
+        norm = str(Path(doc_path))
+        entry = state.get(norm)
+        if entry is None:
+            return None
+        return {
+            "file_path": norm,
+            "version": entry["version"],
+            "file_hash": entry["hash"],
+            "last_indexed": entry["last_indexed"],
+        }
+
+    def list_documents(self) -> list[dict]:
+        state = self._load_state()
+        return [
+            {
+                "file_path": path,
+                "version": info["version"],
+                "last_indexed": info["last_indexed"],
+            }
+            for path, info in state.items()
+        ]
 
     def _load_state(self) -> dict:
         if self.state_file.exists():

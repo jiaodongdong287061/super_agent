@@ -16,6 +16,10 @@ class TestGetLoader:
         loader = get_loader(".docx")
         assert loader is not None
 
+    def test_doc_extension(self):
+        loader = get_loader(".doc")
+        assert loader is not None
+
     def test_md_extension(self):
         loader = get_loader(".md")
         assert loader is not None
@@ -30,6 +34,10 @@ class TestGetLoader:
 
     def test_csv_extension(self):
         loader = get_loader(".csv")
+        assert loader is not None
+
+    def test_txt_extension(self):
+        loader = get_loader(".txt")
         assert loader is not None
 
     def test_unknown_extension_raises(self):
