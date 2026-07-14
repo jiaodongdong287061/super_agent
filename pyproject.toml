@@ -37,6 +37,7 @@ dependencies = [
     "xlrd>=2.0",
     "python-pptx>=0.6.21",
     "prometheus-client>=0.19",
+    "elasticsearch>=8.12,<9",
 ]
 
 [project.optional-dependencies]

@@ -139,8 +139,9 @@ class RAGConfig(BaseSettings):
     enable_metrics: bool = True
     enable_audit: bool = True
     enable_query_rewrite: bool = True
-    enable_query_expansion: bool = False
-    enable_intent_classification: bool = False
+    enable_query_expansion: bool = False  # 查询扩展 → 将 query 扩展为多个同义变体分别检索，扩大召回面（需 LLM 调用，耗时+耗 token）
+    enable_intent_classification: bool = True  # 意图分类 → 识别 query 类型（qa/summarize/instruction），用于下游调整生成 prompt
+    enable_bm25_hybrid: bool = False  # 启用 ES BM25 混合检索（向量 + 关键词双路 → RRF 融合）
     chunker_provider: str = "semantic"
     chunker_use_llm: bool = False
     max_chunk_size: int = 500
@@ -148,6 +149,18 @@ class RAGConfig(BaseSettings):
     default_system_prompt: str = ""
 
     model_config = SettingsConfigDict(env_prefix="SA_RAG_")
+
+
+class ESConfig(BaseSettings):
+    """Elasticsearch 配置（用于 BM25 混合检索）。"""
+    hosts: str = "http://localhost:9200"
+    username: str = ""
+    password: str = ""
+    index_name: str = "super_agent_docs"
+    chunk_batch_size: int = 100
+    ca_certs: str = ""
+
+    model_config = SettingsConfigDict(env_prefix="SA_ES_")
 
 
 class ServerConfig(BaseSettings):
@@ -171,6 +184,7 @@ class Settings(BaseSettings):
     server: ServerConfig = ServerConfig()
     ocr: OCRConfig = OCRConfig()
     rag: RAGConfig = RAGConfig()
+    es: ESConfig = ESConfig()
     env: Literal["dev", "prod"] = "dev"
 
     model_config = SettingsConfigDict(env_prefix="SA_")
@@ -188,6 +202,7 @@ class Settings(BaseSettings):
         self.server = ServerConfig()
         self.ocr = OCRConfig()
         self.rag = RAGConfig()
+        self.es = ESConfig()
         return self
 
 

@@ -1,0 +1,11 @@
+{#
+  # 查询扩展（Query Expansion）
+  #
+  # 用途：对用户的查询生成 2-3 个同义变体，扩大召回面。
+  # 每条变体换行输出、序号开头，LLM 会自然生成中/英/混合表达。
+  # 输入变量：{{ query }} — 要扩展的查询
+  # 输出格式：每行一个，带序号，如 "1. xxx"
+  #}
+You are a query expansion assistant. Given a search query, generate 2-3 alternative phrasings that express the same information need. Return each phrasing on a separate line, numbered. Keep each version concise.
+
+Query: {{ query }}

@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import uuid
 
-import httpx
 from langchain_core.documents import Document
 
 from super_agent.config import settings
@@ -13,17 +12,12 @@ from super_agent.knowledge.chunkers.semantic import (
     estimate_tokens,
     split_sentences,
 )
+from super_agent.knowledge.llm_client import LLMClient
 from super_agent.knowledge.metadata import build_metadata
 from super_agent.knowledge.models import Chunk
+from super_agent.prompts import get_prompt
 
 logger = logging.getLogger(__name__)
-
-_BOUNDARY_PROMPT = (
-    "Split the following text into coherent segments at natural boundary points. "
-    "Return only the sentence indices (0-based) where splits should occur, "
-    "one per line. Each index marks the START of a new segment.\n\n"
-    "Sentences:\n{sentences}"
-)
 
 
 class LLMAssistedChunker(BaseChunker):
@@ -31,11 +25,7 @@ class LLMAssistedChunker(BaseChunker):
         self.use_llm = use_llm
         self.fallback = SemanticChunker()
         if use_llm:
-            cfg = settings.llm
-            self.api_url = f"{cfg.oneapi_base_url.rstrip('/')}/chat/completions"
-            self.api_key = cfg.oneapi_api_key
-            self.model = cfg.default_model
-            self.timeout = cfg.request_timeout
+            self.llm = LLMClient()
 
     def chunk(
         self,
@@ -106,30 +96,27 @@ class LLMAssistedChunker(BaseChunker):
 
         chunks: list[Chunk] = []
         for seg_text in segments:
-            chunks.append(self._make_chunk(seg_text, heading_chain, source, doc_meta))
+            if estimate_tokens(seg_text) > max_chunk_size:
+                # 递归兜底：超过 max_chunk_size 的段 fallback 到规则切分
+                sub_chunks = self.fallback._split_large_section(
+                    seg_text, heading_chain, source, doc_meta, max_chunk_size, overlap_ratio
+                )
+                chunks.extend(sub_chunks)
+            else:
+                chunks.append(self._make_chunk(seg_text, heading_chain, source, doc_meta))
         return chunks
 
     def _suggest_split_points(self, sentences: list[str]) -> list[int]:
         numbered = "\n".join(f"{i}: {s[:80]}" for i, s in enumerate(sentences))
         try:
-            resp = httpx.post(
-                self.api_url,
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": _BOUNDARY_PROMPT.format(sentences=numbered),
-                        }
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 256,
-                },
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=self.timeout,
+            data = self.llm.chat(
+                messages=[
+                    {"role": "user", "content": get_prompt("boundary_split", sentences=numbered)}
+                ],
+                temperature=0.2,
+                max_tokens=256,
             )
-            resp.raise_for_status()
-            text = resp.json()["choices"][0]["message"]["content"]
+            text = data["choices"][0]["message"]["content"]
             points: list[int] = []
             for line in text.strip().split("\n"):
                 line = line.strip()

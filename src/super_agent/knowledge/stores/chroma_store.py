@@ -7,11 +7,14 @@ from super_agent.knowledge.stores.base import BaseVectorStore
 
 
 class ChromaStore(BaseVectorStore):
-    def __init__(self, persist_dir: str | None = None):
+    def __init__(self, persist_dir: str | None = None, tenant_id: str = ""):
         cfg = settings.vector_store
         self.client = chromadb.PersistentClient(path=persist_dir or cfg.chroma_persist_dir)
+        col_name = "super_agent_docs"
+        if tenant_id:
+            col_name = f"{col_name}_{tenant_id}"
         self.collection = self.client.get_or_create_collection(
-            name="super_agent_docs",
+            name=col_name,
             metadata={"hnsw:space": "cosine"},
         )
 
@@ -53,9 +56,10 @@ class ChromaStore(BaseVectorStore):
             self.collection.delete(ids=chunk_ids)
 
     def clear(self) -> None:
-        self.client.delete_collection(name=self.collection.name)
+        col_name = self.collection.name
+        self.client.delete_collection(name=col_name)
         self.collection = self.client.get_or_create_collection(
-            name="super_agent_docs",
+            name=col_name,
             metadata={"hnsw:space": "cosine"},
         )
 

@@ -6,13 +6,15 @@ from super_agent.knowledge.stores.base import BaseVectorStore
 
 
 class MilvusStore(BaseVectorStore):
-    def __init__(self):
+    def __init__(self, tenant_id: str = ""):
         from pymilvus import MilvusClient
         cfg = settings.vector_store
         self.client = MilvusClient(
             uri=f"http://{cfg.milvus_host}:{cfg.milvus_port}"
         )
         self.collection_name = cfg.milvus_collection
+        if tenant_id:
+            self.collection_name = f"{self.collection_name}_{tenant_id}"
         self._ensure_collection()
 
     def _ensure_collection(self):

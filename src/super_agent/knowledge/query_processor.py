@@ -2,37 +2,22 @@ from __future__ import annotations
 
 import logging
 
-import httpx
+from langsmith import traceable
 
 from super_agent.config import settings
+from super_agent.knowledge.llm_client import LLMClient
 from super_agent.knowledge.models import ProcessedQuery
+from super_agent.prompts import get_prompt
 
 logger = logging.getLogger(__name__)
-
-_REWRITE_PROMPT = (
-    "You are a query rewriting assistant. Improve the following search query "
-    "for knowledge base retrieval. Correct typos, expand abbreviations, "
-    "and handle mixed Chinese-English terms. Return ONLY the rewritten query, "
-    "nothing else.\n\nOriginal query: {query}"
-)
-
-_EXPANSION_PROMPT = (
-    "You are a query expansion assistant. Given a search query, generate "
-    "2-3 alternative phrasings that express the same information need. "
-    "Return each phrasing on a separate line, numbered. "
-    "Keep each version concise.\n\nQuery: {query}"
-)
 
 
 class QueryProcessor:
     def __init__(self) -> None:
-        cfg = settings.llm
-        self.api_url = f"{cfg.oneapi_base_url.rstrip('/')}/chat/completions"
-        self.api_key = cfg.oneapi_api_key
-        self.model = cfg.default_model
-        self.timeout = cfg.request_timeout
+        self.llm = LLMClient()
         self.rag_cfg = settings.rag
 
+    @traceable(name="query_processor.process", run_type="chain")
     def process(self, query: str) -> ProcessedQuery:
         rewritten = query
         expansions: list[str] = []
@@ -60,39 +45,27 @@ class QueryProcessor:
             intent=intent,
         )
 
+    @traceable(name="query_processor.rewrite", run_type="llm")
     def _rewrite(self, query: str) -> str:
-        resp = httpx.post(
-            self.api_url,
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "user", "content": _REWRITE_PROMPT.format(query=query)}
-                ],
-                "temperature": 0.3,
-                "max_tokens": 256,
-            },
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=self.timeout,
+        data = self.llm.chat(
+            messages=[
+                {"role": "user", "content": get_prompt("query_rewrite", query=query)}
+            ],
+            temperature=0.3,
+            max_tokens=256,
         )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        return data["choices"][0]["message"]["content"].strip()
 
+    @traceable(name="query_processor.expand", run_type="llm")
     def _expand(self, query: str) -> list[str]:
-        resp = httpx.post(
-            self.api_url,
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "user", "content": _EXPANSION_PROMPT.format(query=query)}
-                ],
-                "temperature": 0.5,
-                "max_tokens": 256,
-            },
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=self.timeout,
+        data = self.llm.chat(
+            messages=[
+                {"role": "user", "content": get_prompt("query_expansion", query=query)}
+            ],
+            temperature=0.5,
+            max_tokens=256,
         )
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
+        text = data["choices"][0]["message"]["content"]
         expansions = [
             line.strip().lstrip("0123456789. ") for line in text.split("\n") if line.strip()
         ]

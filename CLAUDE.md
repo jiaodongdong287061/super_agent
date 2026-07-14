@@ -199,3 +199,8 @@ query → embed → 向量搜索(3×top_k) → (可选 BM25 + RRF) → (可选 R
 
 MD5 文件哈希追踪，`data/index_state/index_state.json` 持久化状态。
 `tags.yaml` 放在 `doc_dir` 根目录，支持精确文件名匹配和 glob 模式匹配。
+
+## 文档规范
+
+所有 plan.md、specs 等设计文档统一存放在 **`.claude/plans/`** 目录下，
+不存到 `docs/` 或其他位置。

@@ -43,9 +43,21 @@ class PDFLoader(BaseLoader):
     def load(self, source: str) -> list[Document]:
         import fitz
 
-        docs = []
         pdf = fitz.open(source)
+        page_docs = self._extract_pages(pdf, source)
+        pdf.close()
+        return self._merge_cross_page_tables(page_docs)
+
+    def _extract_pages(self, pdf, source: str) -> list[tuple[str, int, bool]]:
+        """Extract each page as (text, page_number, table_continues).
+
+        Returns a list of tuples for downstream cross-page table merging.
+        table_continues=True means the page ends with a table boundary
+        that likely spans to the next page.
+        """
+        pages: list[tuple[str, int, bool]] = []
         skipped_scanned = 0
+        total_scanned = 0
         for page_num, page in enumerate(pdf, start=1):
             text = page.get_text()
             if self._is_scanned_page(text, page):
@@ -53,27 +65,75 @@ class PDFLoader(BaseLoader):
                 if not text:
                     skipped_scanned += 1
                     continue
-                docs.append(
-                    Document(
-                        page_content=text,
-                        metadata={"source": source, "page_numbers": [page_num], "ocr_used": True},
-                    )
-                )
+                total_scanned += 1
+                table_continues = self._has_cross_page_table(page)
+                pages.append((text, page_num, table_continues))
             elif text.strip():
-                docs.append(
-                    Document(
-                        page_content=text,
-                        metadata={"source": source, "page_numbers": [page_num], "ocr_used": False},
-                    )
-                )
-        pdf.close()
+                table_continues = self._has_cross_page_table(page)
+                pages.append((text, page_num, table_continues))
+
         if skipped_scanned:
             logger.warning(
                 "PDF '%s': %d/%d pages are scanned and no OCR engine available — skipped. "
                 "Install with: uv sync --extra ml",
-                source, skipped_scanned, skipped_scanned + len(docs),
+                source, skipped_scanned, skipped_scanned + len(pages) + total_scanned,
+            )
+        return pages
+
+    def _merge_cross_page_tables(
+        self, pages: list[tuple[str, int, bool]]
+    ) -> list[Document]:
+        """Merge consecutive pages where a table spans page boundaries."""
+        if not pages:
+            return []
+
+        docs: list[Document] = []
+        accumulated_texts: list[str] = []
+        accumulated_page_nums: list[int] = []
+
+        for text, page_num, table_continues in pages:
+            accumulated_texts.append(text)
+            accumulated_page_nums.append(page_num)
+            if not table_continues:
+                docs.append(
+                    Document(
+                        page_content="\n\n".join(accumulated_texts),
+                        metadata={
+                            "source": "pdf",
+                            "page_numbers": list(accumulated_page_nums),
+                        },
+                    )
+                )
+                accumulated_texts = []
+                accumulated_page_nums = []
+
+        # Flush remaining accumulated pages
+        if accumulated_texts:
+            docs.append(
+                Document(
+                    page_content="\n\n".join(accumulated_texts),
+                    metadata={
+                        "source": "pdf",
+                        "page_numbers": list(accumulated_page_nums),
+                    },
+                )
             )
         return docs
+
+    @staticmethod
+    def _has_cross_page_table(page) -> bool:
+        """Check if the page has a table at its bottom edge, indicating it spans to next page."""
+        try:
+            tables = page.find_tables()
+            page_height = page.rect.height
+            # If a table's bottom is within 3% of the page height, it likely continues
+            threshold = page_height * 0.03
+            for table in tables:
+                if page_height - table.bbox.y1 < threshold:
+                    return True
+            return False
+        except Exception:
+            return False
 
     def _is_scanned_page(self, text: str, page) -> bool:
         if not settings.ocr.enabled:

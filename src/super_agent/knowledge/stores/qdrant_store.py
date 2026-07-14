@@ -6,7 +6,7 @@ from super_agent.knowledge.stores.base import BaseVectorStore
 
 
 class QdrantStore(BaseVectorStore):
-    def __init__(self):
+    def __init__(self, tenant_id: str = ""):
         from qdrant_client import QdrantClient
 
         cfg = settings.vector_store
@@ -16,6 +16,8 @@ class QdrantStore(BaseVectorStore):
 
         self.client = QdrantClient(**client_kwargs)
         self.collection_name = cfg.qdrant_collection
+        if tenant_id:
+            self.collection_name = f"{self.collection_name}_{tenant_id}"
         self._ensure_collection()
 
     def _ensure_collection(self):

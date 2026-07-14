@@ -73,3 +73,4 @@ class UserContext:
     user_id: str = ""
     roles: list[str] = field(default_factory=list)
     department: str = ""
+    tenant_id: str = ""

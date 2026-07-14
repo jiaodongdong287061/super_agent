@@ -1,35 +1,27 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
+from collections.abc import Generator
 
-import httpx
+from langsmith import traceable
 
 from super_agent.config import settings
+from super_agent.knowledge.llm_client import LLMClient
 from super_agent.knowledge.models import Chunk, Citation, GeneratedAnswer
+from super_agent.prompts import get_prompt
 
 logger = logging.getLogger(__name__)
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 
-_DEFAULT_SYSTEM_PROMPT = (
-    "You are an enterprise knowledge assistant. Answer the user's question using "
-    "ONLY the provided source documents. Cite sources using their numbers in "
-    "brackets like [1]. If no source contains the answer, say "
-    "'No relevant information found in the knowledge base.'"
-)
-
 
 class AnswerGenerator:
     def __init__(self) -> None:
-        cfg = settings.llm
-        self.api_url = f"{cfg.oneapi_base_url.rstrip('/')}/chat/completions"
-        self.api_key = cfg.oneapi_api_key
-        self.model = cfg.default_model
-        self.temperature = cfg.default_temperature
-        self.max_tokens = cfg.max_tokens
-        self.timeout = cfg.request_timeout
+        self.llm = LLMClient()
 
+    @traceable(name="answer_generator.generate", run_type="chain")
     def generate(
         self,
         query: str,
@@ -39,7 +31,7 @@ class AnswerGenerator:
     ) -> GeneratedAnswer:
         context = self._format_context(chunks)
         messages = [
-            {"role": "system", "content": system_prompt or _DEFAULT_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt or get_prompt("qa_system")},
             {
                 "role": "user",
                 "content": (
@@ -52,19 +44,10 @@ class AnswerGenerator:
         ]
 
         try:
-            resp = httpx.post(
-                self.api_url,
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature if temperature is not None else self.temperature,
-                    "max_tokens": self.max_tokens,
-                },
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=self.timeout,
+            data = self.llm.chat(
+                messages=messages,
+                temperature=temperature,
             )
-            resp.raise_for_status()
-            data = resp.json()
             answer_text = data["choices"][0]["message"]["content"]
         except Exception as e:
             logger.error("LLM generation failed: %s", e)
@@ -103,3 +86,60 @@ class AnswerGenerator:
                 )
             )
         return citations
+
+    def generate_stream(
+        self,
+        query: str,
+        chunks: list[Chunk],
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+    ) -> Generator[str, None, None]:
+        """流式生成答案，通过 SSE 事件逐 token 产出。
+
+        SSE 事件格式：
+          data: {"type": "sources", "sources": [...]}
+          data: {"type": "token", "text": "..."}
+          data: {"type": "citations", "citations": [...]}
+          data: {"type": "done"}
+        """
+        context = self._format_context(chunks)
+        messages = [
+            {"role": "system", "content": system_prompt or get_prompt("qa_system")},
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {query}\n\n"
+                    f"Source documents:\n{context}\n\n"
+                    "Answer the question using ONLY the sources above. "
+                    "Cite sources with [N]."
+                ),
+            },
+        ]
+
+        # 1. Send search results as initial event
+        sources = [
+            {
+                "chunk_id": c.id,
+                "content": c.content[:200],
+                "metadata": c.metadata,
+                "page_numbers": c.page_numbers,
+            }
+            for c in chunks
+        ]
+        yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+
+        # 2. Stream tokens from LLM
+        full_text = ""
+        try:
+            for token in self.llm.chat_stream(messages=messages, temperature=temperature):
+                full_text += token
+                yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
+        except Exception as e:
+            logger.error("Stream generation failed: %s", e)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            return
+
+        # 3. Parse citations from full answer
+        citations = self._parse_citations(full_text, chunks)
+        yield f"data: {json.dumps({'type': 'citations', 'citations': [c.model_dump() for c in citations]})}\n\n"
+        yield "data: {\"type\": \"done\"}\n\n"

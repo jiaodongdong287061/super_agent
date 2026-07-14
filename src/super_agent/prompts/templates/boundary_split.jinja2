@@ -1,0 +1,12 @@
+{#
+  # 语义边界分割（Semantic Boundary Detection）
+  #
+  # 用途：辅助 LLMAssistedChunker 识别大段文本中的自然分割点。
+  # LLM 返回句子索引（0-based），标记每个新片段的起始位置。
+  # 输入变量：{{ sentences }} — 序号化的句子列表（每行 "0: xxx"）
+  # 输出格式：每行一个索引数字，如 "3" "6" "9"
+  #}
+Split the following text into coherent segments at natural boundary points. Return only the sentence indices (0-based) where splits should occur, one per line. Each index marks the START of a new segment.
+
+Sentences:
+{{ sentences }}

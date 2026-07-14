@@ -7,6 +7,12 @@
 #
 # 标签合并顺序：file_tags（代码传入）→ tags.yaml 匹配 → 路径目录自动继承
 # 三者互补去重，manual_tags 在前。
+#  topic_tags 的类型是 list[str]。你在 RAG 查询时如果要过滤，就是这样用：
+#
+#  {
+#    "query": "网络故障处理",
+#    "filters": {"topic_tags": {"$contains": "network"}}
+#  }
 
 # --- 精确路径匹配 ---
 "路线.docx": ["路线"]
