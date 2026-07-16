@@ -87,7 +87,7 @@ class LLMClient:
                     continue
 
                 resp.raise_for_status()
-            except (httpx.TimeoutException, httpx.ConnectionError) as e:
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
                 last_exc = e
                 if attempt < self.retry_max:
                     delay = self.retry_base_delay * (2 ** (attempt - 1))
@@ -154,12 +154,15 @@ class LLMClient:
                         if payload == "[DONE]":
                             return
                         chunk = json.loads(payload)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        choices = chunk.get("choices", [{}])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
                         content = delta.get("content", "")
                         if content:
                             yield content
                     return  # stream completed normally
-            except (httpx.TimeoutException, httpx.ConnectionError) as e:
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
                 last_exc = e
                 if attempt < self.retry_max:
                     delay = self.retry_base_delay * (2 ** (attempt - 1))

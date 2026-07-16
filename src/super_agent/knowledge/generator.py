@@ -132,8 +132,18 @@ class AnswerGenerator:
         full_text = ""
         try:
             for token in self.llm.chat_stream(messages=messages, temperature=temperature):
-                full_text += token
-                yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
+                logger.debug("Stream token: len=%d repr=%r", len(token), token[:100])
+                # deepseek 等部分模型在流式返回时 content 会携带累积文本而非增量
+                # 检测并截取增量部分，避免前端重复拼接
+                if full_text and token.startswith(full_text):
+                    new_part = token[len(full_text):]
+                    if not new_part:
+                        continue
+                    full_text = token
+                    yield f"data: {json.dumps({'type': 'token', 'text': new_part})}\n\n"
+                else:
+                    full_text += token
+                    yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
         except Exception as e:
             logger.error("Stream generation failed: %s", e)
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -141,5 +151,5 @@ class AnswerGenerator:
 
         # 3. Parse citations from full answer
         citations = self._parse_citations(full_text, chunks)
-        yield f"data: {json.dumps({'type': 'citations', 'citations': [c.model_dump() for c in citations]})}\n\n"
+        yield f"data: {json.dumps({'type': 'citations', 'citations': [{'chunk_id': c.chunk_id, 'source_doc': c.source_doc, 'page_numbers': c.page_numbers, 'content_snippet': c.content_snippet} for c in citations]})}\n\n"
         yield "data: {\"type\": \"done\"}\n\n"

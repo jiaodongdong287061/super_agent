@@ -16,14 +16,18 @@ class APIEmbedder(BaseEmbedder):
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         cfg = settings.embedding
-        batch_size = cfg.api_batch_size or 64
         all_embeddings: list[list[float]] = []
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
+        for text in texts:
+            if not text or not text.strip():
+                logger.warning("Skipping empty text in embedding request")
+                continue
+            payload = {"model": cfg.api_model, "input": text}
+            logger.info("Embedding request: model=%s input_len=%d preview=%s",
+                        cfg.api_model, len(text), text[:80])
             resp = httpx.post(
                 f"{cfg.api_url}",
-                json={"model": cfg.api_model, "input": batch},
+                json=payload,
                 headers={"Authorization": f"Bearer {cfg.api_key}"},
                 timeout=60.0,
             )
@@ -33,11 +37,14 @@ class APIEmbedder(BaseEmbedder):
                     resp.status_code,
                     resp.text,
                 )
+                raise RuntimeError(f"Embedding API returned {resp.status_code}: {resp.text}")
             resp.raise_for_status()
             data = resp.json()["data"]
             embeddings = [d["embedding"] for d in sorted(data, key=lambda x: x["index"])]
             all_embeddings.extend(embeddings)
 
+        if not all_embeddings:
+            raise RuntimeError("Embedding returned empty result, check query content")
         return all_embeddings
 
     def embed_query(self, text: str) -> list[float]:

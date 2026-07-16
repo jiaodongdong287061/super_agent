@@ -55,7 +55,9 @@ class QdrantStore(BaseVectorStore):
         if filters:
             conditions = []
             for key, value in filters.items():
-                if key == "topic_tags" and isinstance(value, dict) and "$contains" in value:
+                if isinstance(value, dict) and "$eq" in value:
+                    conditions.append(FieldCondition(key=key, match=MatchValue(value=value["$eq"])))
+                elif key == "topic_tags" and isinstance(value, dict) and "$contains" in value:
                     conditions.append(FieldCondition(key=key, match=MatchAny(any=[value["$contains"]])))
                 elif isinstance(value, dict) and "$in" in value:
                     conditions.append(FieldCondition(key=key, match=MatchAny(any=value["$in"])))

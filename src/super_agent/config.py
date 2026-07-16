@@ -189,7 +189,7 @@ class SSOConfig(BaseSettings):
     auth_base_url: str = "http://localhost:8081"
     frontend_url: str = "http://localhost:8000"
     whitelist: list[str] = ["/health", "/metrics", "/docs", "/openapi.json", "/auth/login", "/auth/callback"]
-    jwt_secret: str = "abcdefghijklmnopqrstuvwxyz"  # !!! 建议 4 的倍数长度（如 24/28/32 字符），否则 Java DatatypeConverter 会丢弃尾部
+    jwt_secret: str = ""  # 必须通过 SA_SSO_JWT_SECRET 配置，需和 Java SSO 端一致
     session_max_age: int = 43200  # 12小时
     redis_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"

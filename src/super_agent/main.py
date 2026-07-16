@@ -104,8 +104,11 @@ def _build_retriever(user: UserContext):
 
     es_client = None
     if settings.rag.enable_bm25_hybrid:
-        from super_agent.knowledge.es_client import ESClient
-        es_client = ESClient()
+        try:
+            from super_agent.knowledge.es_client import ESClient
+            es_client = ESClient()
+        except Exception as e:
+            logger.warning("ES client init failed, BM25 hybrid disabled: %s", e)
 
     if user.tenant_id:
         store = get_store(tenant_id=user.tenant_id)
@@ -165,7 +168,12 @@ def _resolve_user(request: Request, body_user: UserContext) -> UserContext:
     """Resolve user from SSO session or request body."""
     state_user = getattr(request, "state", None)
     if state_user and hasattr(state_user, "user"):
-        return state_user.user
+        user = state_user.user
+        logger.info("Resolved user from SSO: user_id=%s department=%s roles=%s",
+                     user.user_id, user.department, user.roles)
+        return user
+    logger.info("Resolved user from request body: user_id=%s department=%s roles=%s",
+                 body_user.user_id, body_user.department, body_user.roles)
     return body_user
 
 
@@ -342,8 +350,11 @@ async def rag_batch_query(req: BatchQueryRequest):
 
     es_client = None
     if settings.rag.enable_bm25_hybrid:
-        from super_agent.knowledge.es_client import ESClient
-        es_client = ESClient()
+        try:
+            from super_agent.knowledge.es_client import ESClient
+            es_client = ESClient()
+        except Exception as e:
+            logger.warning("ES client init failed, BM25 hybrid disabled: %s", e)
 
     store = get_store()
 
@@ -417,8 +428,11 @@ async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_
     # ES BM25 hybrid client
     es_client = None
     if settings.rag.enable_bm25_hybrid:
-        from super_agent.knowledge.es_client import ESClient
-        es_client = ESClient()
+        try:
+            from super_agent.knowledge.es_client import ESClient
+            es_client = ESClient()
+        except Exception as e:
+            logger.warning("ES client init failed, BM25 hybrid disabled: %s", e)
 
     indexer = Indexer(store=store, embedder=embedder, chunker=chunker, tenant_id=tenant_id, es_client=es_client)
     if force:

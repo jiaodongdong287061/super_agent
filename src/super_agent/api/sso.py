@@ -222,14 +222,20 @@ class SSOMiddleware(BaseHTTPMiddleware):
 
         user_id = str(claims.get("user_id", ""))
         username = str(claims.get("username", ""))
+        department = str(claims.get("dept_id", ""))
+        roles_raw = claims.get("roles", [])
+        if isinstance(roles_raw, list):
+            roles = [str(r) for r in roles_raw]
+        else:
+            roles = [str(roles_raw)]
 
         from super_agent.knowledge.models import UserContext
 
         request.state.user = UserContext(
             user_id=user_id,
-            department="",
+            department=department,
             tenant_id="",
-            roles=[],
+            roles=roles,
         )
         # Also pass username for display purposes
         request.state.username = username
@@ -313,10 +319,16 @@ def register_sso_routes(app: FastAPI) -> None:
         if claims is None:
             return JSONResponse(status_code=401, content={"code": 401, "message": "未登录或会话已过期"})
 
+        roles_raw = claims.get("roles", [])
+        if isinstance(roles_raw, list):
+            roles = [str(r) for r in roles_raw]
+        else:
+            roles = [str(roles_raw)]
+
         return {
             "user_id": str(claims.get("user_id", "")),
             "username": str(claims.get("username", "")),
             "display_name": str(claims.get("username", "")),
-            "roles": [],
-            "department": "",
+            "roles": roles,
+            "department": str(claims.get("dept_id", "")),
         }

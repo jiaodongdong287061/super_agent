@@ -47,7 +47,9 @@
       "Bash(tasklist //FI \"PID eq 18224\" //FO CSV //NH)",
       "Bash(wsl -- ps aux)",
       "Bash(wmic process *)",
-      "Bash(SA_SERVER_PORT=8001 uv run uvicorn super_agent.main:app --port 8001 --log-level info)"
+      "Bash(SA_SERVER_PORT=8001 uv run uvicorn super_agent.main:app --port 8001 --log-level info)",
+      "WebSearch",
+      "WebFetch(domain:docs.bigmodel.cn)"
     ]
   }
 }

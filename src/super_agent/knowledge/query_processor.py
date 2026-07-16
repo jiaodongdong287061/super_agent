@@ -25,12 +25,16 @@ class QueryProcessor:
         if self.rag_cfg.enable_query_rewrite:
             try:
                 rewritten = self._rewrite(query)
+                if not rewritten or not rewritten.strip():
+                    logger.warning("Query rewrite returned empty, using original: %r", query)
+                    rewritten = query
             except Exception as e:
                 logger.warning("Query rewrite failed, using original: %s", e)
 
         if self.rag_cfg.enable_query_expansion:
             try:
                 expansions = self._expand(rewritten)
+                expansions = [e for e in expansions if e and e.strip()]
             except Exception as e:
                 logger.warning("Query expansion failed: %s", e)
 

@@ -59,7 +59,7 @@ class Indexer:
             seen_paths.add(rel_path)
 
             old_state = state.get(rel_path)
-            if old_state and old_state.get("hash") == file_hash:
+            if isinstance(old_state, dict) and old_state.get("hash") == file_hash:
                 continue
 
             loader = get_loader(fp.suffix.lower())
@@ -71,8 +71,8 @@ class Indexer:
             merged = manual_tags + [t for t in yaml_matched if t not in manual_tags]
 
             # Version tracking: increment if file changed
-            old_version = old_state.get("version", "0") if old_state else "0"
-            new_version = str(int(old_version) + 1) if old_state and old_state.get("hash") != file_hash else old_version
+            old_version = old_state.get("version", "0") if isinstance(old_state, dict) else "0"
+            new_version = str(int(old_version) + 1) if isinstance(old_state, dict) and old_state.get("hash") != file_hash else old_version
 
             for doc in documents:
                 doc.metadata["manual_tags"] = merged
