@@ -15,12 +15,14 @@ from __future__ import annotations
 import logging
 import os
 
+from opentelemetry import trace as _trace
+
 from super_agent.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 全局 OTel tracer，供整个应用使用
-tracer: "trace.Tracer"  # type: ignore[name-defined]  # noqa: F821
+# 全局 OTel tracer，供整个应用使用。默认 no-op，setup_tracing() 后替换为真实 tracer
+tracer = _trace.get_tracer("super-agent")
 
 
 def setup_tracing() -> None:
@@ -32,11 +34,7 @@ def setup_tracing() -> None:
 
     if settings.tracing.enable_otel:
         _setup_otel()
-    else:
-        # Fallback: no-op tracer
-        from opentelemetry import trace as _trace
-
-        tracer = _trace.get_tracer("super-agent")
+    # else: 模块级 no-op tracer 已就绪
 
 
 def _setup_langsmith() -> None:

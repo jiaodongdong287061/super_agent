@@ -38,6 +38,7 @@ dependencies = [
     "python-pptx>=0.6.21",
     "prometheus-client>=0.19",
     "elasticsearch>=8.12,<9",
+    "pyjwt>=2.8",
 ]
 
 [project.optional-dependencies]

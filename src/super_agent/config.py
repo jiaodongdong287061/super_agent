@@ -173,6 +173,32 @@ class ServerConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SA_SERVER_")
 
 
+class SSOConfig(BaseSettings):
+    """OAuth2 SSO 登录配置（授权码模式）。
+
+    接入授权中心（OAuth2 Server），通过标准的 Authorization Code 流程获取用户身份。
+    enable=false 时跳过认证（开发/测试环境）。
+
+    JWT 认证: 使用 SSO 签发的 Ruoyi JWT (HS512) 作为会话凭证。
+    可选 Redis 验证: 查询 SSO 的 Redis 确认 token 未被注销。
+    """
+    enable: bool = False
+    client_id: str = ""
+    client_secret: str = ""
+    redirect_uri: str = "http://localhost:8000/auth/callback"
+    auth_base_url: str = "http://localhost:8081"
+    frontend_url: str = "http://localhost:8000"
+    whitelist: list[str] = ["/health", "/metrics", "/docs", "/openapi.json", "/auth/login", "/auth/callback"]
+    jwt_secret: str = "abcdefghijklmnopqrstuvwxyz"  # !!! 建议 4 的倍数长度（如 24/28/32 字符），否则 Java DatatypeConverter 会丢弃尾部
+    session_max_age: int = 43200  # 12小时
+    redis_enabled: bool = True
+    redis_url: str = "redis://localhost:6379/0"
+    redis_password: str = ""
+    redis_key_prefix: str = "login_tokens:"
+
+    model_config = SettingsConfigDict(env_prefix="SA_SSO_")
+
+
 class Settings(BaseSettings):
     llm: LLMConfig = LLMConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
@@ -181,6 +207,7 @@ class Settings(BaseSettings):
     mysql: MySQLConfig = MySQLConfig()
     sandbox: SandboxConfig = SandboxConfig()
     tracing: TracingConfig = TracingConfig()
+    sso: SSOConfig = SSOConfig()
     server: ServerConfig = ServerConfig()
     ocr: OCRConfig = OCRConfig()
     rag: RAGConfig = RAGConfig()
@@ -199,6 +226,7 @@ class Settings(BaseSettings):
         self.mysql = MySQLConfig()
         self.sandbox = SandboxConfig()
         self.tracing = TracingConfig()
+        self.sso = SSOConfig()
         self.server = ServerConfig()
         self.ocr = OCRConfig()
         self.rag = RAGConfig()

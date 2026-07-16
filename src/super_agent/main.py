@@ -6,9 +6,11 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from super_agent.config import settings
@@ -83,6 +85,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# OAuth2 SSO 认证
+from super_agent.api.sso import SSOMiddleware, register_sso_routes
+app.add_middleware(SSOMiddleware)
+register_sso_routes(app)
+
 # ── Core helpers ──────────────────────────────────────────────
 
 
@@ -154,6 +161,14 @@ def _format_sources(chunks: list) -> list[dict]:
     ]
 
 
+def _resolve_user(request: Request, body_user: UserContext) -> UserContext:
+    """Resolve user from SSO session or request body."""
+    state_user = getattr(request, "state", None)
+    if state_user and hasattr(state_user, "user"):
+        return state_user.user
+    return body_user
+
+
 # ── Endpoints ─────────────────────────────────────────────────
 
 
@@ -169,7 +184,7 @@ async def metrics():
 
 
 @app.post("/rag/query", response_model=QueryResponse)
-async def rag_query(req: QueryRequest):
+async def rag_query(req: QueryRequest, request: Request):
     """RAG 检索 + LLM 答案生成。
 
     流程：Query 改写 → Embed → 向量检索 → (可选 BM25 + RRF) → (可选 Rerank) → LLM 生成答案 → 审计日志
@@ -194,14 +209,15 @@ async def rag_query(req: QueryRequest):
     """
     t_start = time.time()
     try:
-        retriever = _build_retriever(req.user)
+        user = _resolve_user(request, req.user)
+        retriever = _build_retriever(user)
 
         # Query understanding + retrieval
         retrieval_timer = RetrievalTimer()
         with retrieval_timer, tracer.start_as_current_span("retrieval") as span:
             chunks = _retrieve_chunks(
                 query=req.query, top_k=req.top_k, retriever=retriever,
-                filters=req.filters, user=req.user,
+                filters=req.filters, user=user,
             )
             span.set_attribute("num_chunks", len(chunks))
             retrieval_timer.record_chunks(chunks)
@@ -247,7 +263,7 @@ async def rag_query(req: QueryRequest):
 
         audit = AuditLogger()
         await audit.log_query(
-            user_id=req.user.user_id,
+            user_id=user.user_id,
             query=req.query,
             num_chunks=len(chunks),
             chunk_ids=[c.id for c in chunks],
@@ -262,7 +278,7 @@ async def rag_query(req: QueryRequest):
 
 
 @app.post("/rag/query/stream")
-async def rag_query_stream(req: QueryRequest):
+async def rag_query_stream(req: QueryRequest, request: Request):
     """SSE 流式 RAG 检索 + 答案生成。
 
     与 /rag/query 功能相同，但 LLM 生成部分以 SSE 流式输出。
@@ -276,13 +292,14 @@ async def rag_query_stream(req: QueryRequest):
     """
     async def _generate() -> AsyncGenerator[str, None]:
         try:
-            retriever = _build_retriever(req.user)
+            user = _resolve_user(request, req.user)
+            retriever = _build_retriever(user)
 
             retrieval_timer = RetrievalTimer()
             with retrieval_timer:
                 chunks = _retrieve_chunks(
                     query=req.query, top_k=req.top_k, retriever=retriever,
-                    filters=req.filters, user=req.user,
+                    filters=req.filters, user=user,
                 )
                 retrieval_timer.record_chunks(chunks)
 
@@ -490,6 +507,12 @@ async def rag_doc_list(tenant_id: str = ""):
     chunker = SemanticChunker()
     indexer = Indexer(store=store, embedder=embedder, chunker=chunker, tenant_id=tenant_id)
     return {"documents": indexer.list_documents()}
+
+
+# 静态文件（前端聊天界面），放在所有 API 路由之后以免拦截请求
+static_dir = Path(__file__).resolve().parent / "static"
+if static_dir.exists():
+    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
 
 def main():

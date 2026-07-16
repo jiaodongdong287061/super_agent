@@ -93,6 +93,17 @@
 ### 11. 缺乏 API 认证与速率限制
 - `/rag/query`、`/rag/index` 等端点无认证、无速率限制
 - 直接暴露在生产环境有安全风险
+- **→ 已实现：OAuth2 SSO 认证（Authorization Code 模式）**
+  - 新增 `api/sso.py`：SSO 认证模块
+  - **流程**（匹配 sso.md 文档）:
+    1. `GET /auth/login` → 302 重定向到授权中心 authorize URL
+    2. 用户登录后 → 授权中心回调 `GET /auth/callback?code=xxx`
+    3. 后端换 token → 调 `/system/user/getInfo` 拿用户信息
+    4. 创建 HMAC-SHA256 签名会话 → 写 httpOnly cookie → 302 到前端
+    5. 后续请求 cookie（或 `Authorization: Bearer`） → `SSOMiddleware` 校验
+  - **中间件**: `SSOMiddleware` 注入 `request.state.user`（UserContext）
+  - **端点**: `/auth/login`、`/auth/callback`、`/auth/logout`、`/auth/me`
+  - **配置**: `SA_SSO_ENABLE`（dev=false, prod=true）
 
 ### 12. 追踪仅 Prometheus 埋点，未接 LangSmith/OTel
 - `tracing/metrics.py` 只有基础 Prometheus 指标
