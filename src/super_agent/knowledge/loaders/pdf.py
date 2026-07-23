@@ -20,11 +20,12 @@ def _check_paddleocr() -> bool:
             import paddleocr  # noqa: F401
 
             _PADDLEOCR_AVAILABLE = True
-        except ImportError:
+        except Exception:
             _PADDLEOCR_AVAILABLE = False
             logger.warning(
-                "paddleocr is not installed. Scanned PDF pages will be skipped. "
-                "Install with: uv sync --extra ml"
+                "paddleocr is not available. Scanned PDF pages will be skipped. "
+                "Install with: uv sync --extra ml",
+                exc_info=True,
             )
     return _PADDLEOCR_AVAILABLE
 
@@ -49,11 +50,11 @@ class PDFLoader(BaseLoader):
         return self._merge_cross_page_tables(page_docs)
 
     def _extract_pages(self, pdf, source: str) -> list[tuple[str, int, bool]]:
-        """Extract each page as (text, page_number, table_continues).
+        """提取每一页的内容，返回 (文本, 页码, 是否跨页).
 
-        Returns a list of tuples for downstream cross-page table merging.
-        table_continues=True means the page ends with a table boundary
-        that likely spans to the next page.
+        返回元组列表供下游跨页表格合并使用。
+        table_continues=True 表示该页末尾有表格边界，
+        大概率跨到下一页。
         """
         pages: list[tuple[str, int, bool]] = []
         skipped_scanned = 0
@@ -83,7 +84,7 @@ class PDFLoader(BaseLoader):
     def _merge_cross_page_tables(
         self, pages: list[tuple[str, int, bool]]
     ) -> list[Document]:
-        """Merge consecutive pages where a table spans page boundaries."""
+        """合并跨页的表格：连续页中 table_continues=True 的表合并为一个文档。"""
         if not pages:
             return []
 
@@ -107,7 +108,7 @@ class PDFLoader(BaseLoader):
                 accumulated_texts = []
                 accumulated_page_nums = []
 
-        # Flush remaining accumulated pages
+        # 清空剩余的累积页
         if accumulated_texts:
             docs.append(
                 Document(
@@ -122,11 +123,11 @@ class PDFLoader(BaseLoader):
 
     @staticmethod
     def _has_cross_page_table(page) -> bool:
-        """Check if the page has a table at its bottom edge, indicating it spans to next page."""
+        """检查页面底部是否有表格，判断是否跨页。"""
         try:
             tables = page.find_tables()
             page_height = page.rect.height
-            # If a table's bottom is within 3% of the page height, it likely continues
+            # 表格底部距页底不足 3% 时，大概率跨页
             threshold = page_height * 0.03
             for table in tables:
                 if page_height - table.bbox.y1 < threshold:

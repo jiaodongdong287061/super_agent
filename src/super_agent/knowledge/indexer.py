@@ -13,6 +13,7 @@ from super_agent.knowledge.embedders.base import BaseEmbedder
 from super_agent.knowledge.chunkers.base import BaseChunker
 from super_agent.knowledge.loaders import get_loader, supported_extensions
 from super_agent.knowledge.tags import parse_tags_yaml, match_file_tags
+from super_agent.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class Indexer:
         state_dir: str = "./data/index_state",
         tenant_id: str = "",
         es_client=None,  # ESClient | None: BM25 混合检索用
+        doc_level: str = "L1",
     ):
         self.store = store
         self.embedder = embedder
@@ -35,6 +37,7 @@ class Indexer:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         state_file_name = f"index_state_{tenant_id}.json" if tenant_id else "index_state.json"
         self.state_file = self.state_dir / state_file_name
+        self.doc_level = doc_level
 
     @traceable(name="indexer.build", run_type="chain")
     def build(self, doc_dir: str, file_tags: dict[str, list[str]] | None = None, **kwargs) -> None:
@@ -70,13 +73,19 @@ class Indexer:
             yaml_matched = match_file_tags(norm_path, yaml_tags)
             merged = manual_tags + [t for t in yaml_matched if t not in manual_tags]
 
-            # Version tracking: increment if file changed
+            # LLM 自动打标：当无手动标注且开启配置时，用 LLM 生成 topic_tags
+            llm_tags = _generate_llm_tags(documents, file_path=str(fp)) if not merged and settings.rag.enable_llm_tagging else None
+            if llm_tags:
+                merged = llm_tags
+
+            # 版本追踪：文件变更时递增版本号
             old_version = old_state.get("version", "0") if isinstance(old_state, dict) else "0"
             new_version = str(int(old_version) + 1) if isinstance(old_state, dict) and old_state.get("hash") != file_hash else old_version
 
             for doc in documents:
                 doc.metadata["manual_tags"] = merged
                 doc.metadata["doc_version"] = new_version
+                doc.metadata["doc_level"] = self.doc_level
 
             chunks = self.chunker.chunk(documents, **kwargs)
 
@@ -95,13 +104,13 @@ class Indexer:
             }
             self._save_state(state)  # 每文件保存，防止中途中断丢失状态
 
-        # Clean up deleted files: files in state but no longer on disk
+        # 清理已删除的文件：state 中存在但磁盘上已删除的文件
         stale_paths = [p for p in state if p not in current_files]
         if stale_paths:
             stale_chunk_ids: list[str] = []
             for p in stale_paths:
                 stale_chunk_ids.extend(state[p].get("chunk_ids", []))
-                # Clean ES index too
+                # 同时清理 ES 索引
                 if self.es_client:
                     self.es_client.delete_by_file_path(p)
                 del state[p]
@@ -154,3 +163,30 @@ class Indexer:
     @staticmethod
     def _file_hash(path: Path) -> str:
         return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+def _generate_llm_tags(documents: list, file_path: str) -> list[str] | None:
+    """调用 LLM 为文档生成 topic_tags。"""
+    try:
+        from super_agent.knowledge.llm_client import LLMClient
+        from super_agent.prompts import get_prompt
+
+        # 取文档内容前 1500 字作为分析素材
+        content = "\n".join(doc.page_content[:1500] for doc in documents if doc.page_content)
+        if not content:
+            return None
+
+        prompt = get_prompt("topic_tagging", content=content)
+        data = LLMClient().chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=128,
+        )
+        text = data["choices"][0]["message"]["content"].strip()
+        tags = [t.strip() for t in text.split(",") if t.strip()]
+        if tags:
+            logger.info("LLM-tagged %s → %s", file_path, tags)
+            return tags
+    except Exception as e:
+        logger.warning("LLM tagging failed for %s: %s", file_path, e)
+    return None

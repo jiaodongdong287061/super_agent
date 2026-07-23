@@ -64,7 +64,7 @@ super_agent/
 │   │   │   └── ppt.py              # .pptx（python-pptx）/ .ppt（LibreOffice）
 │   │   ├── chunkers/
 │   │   │   ├── base.py             # BaseChunker 抽象接口
-│   │   │   └── semantic.py         # SemanticChunker（标题链 + 句子级 overlap）
+│   │   │   └── semantic.py         # SemanticChunker（标题链 + 句子级 overlap + embedding 语义边界）
 │   │   ├── embedders/
 │   │   │   ├── base.py             # BaseEmbedder 抽象接口
 │   │   │   └── api.py              # APIEmbedder（远程 API，自动分批 64 条）

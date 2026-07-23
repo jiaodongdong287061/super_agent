@@ -1,0 +1,39 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: super-agent-qdrant
+    ports:
+      - "31244:6333"
+      - "31245:6334"
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      QDRANT__LOG_LEVEL: INFO
+    volumes:
+      - qdrant-data:/qdrant/storage
+    # ==========新增下面这段！提升文件句柄上限==========
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 1g
+    networks:
+      - super-agent-net
+    restart: unless-stopped
+    healthcheck:
+      test: curl -s http://localhost:6333/health >/dev/null 2>&1
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  qdrant-data:
+
+networks:
+  super-agent-net:
+    driver: bridge

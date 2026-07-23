@@ -1,0 +1,26 @@
+services:
+  flagembedding:
+    build:
+      context: ./services/flagembedding
+      dockerfile: Dockerfile
+    image: flagembedding-service:latest
+    container_name: super-agent-flagembedding
+    ports:
+      - "31241:8001"
+    environment:
+      - FE_DEVICE=cpu
+      - FE_EMBED_MODEL=BAAI/bge-m3
+      - FE_RERANK_MODEL=BAAI/bge-reranker-v2-m3
+      - FE_EMBED_DIM=2048
+      - HF_ENDPOINT=https://hf-mirror.com
+    volumes:
+      - flagembedding-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        limits:
+          memory: 64g
+          cpus: "16"
+    restart: unless-stopped
+
+volumes:
+  flagembedding-cache:

@@ -10,6 +10,30 @@ def _make_doc(text: str, source: str = "test.md", page: int | None = None) -> Do
     return Document(page_content=text, metadata=meta)
 
 
+class _MockEmbedder:
+    """Mock embedder returning topic-grouped vectors for semantic boundary tests."""
+    def __init__(self, boundary_index: int = 5):
+        self.boundary_index = boundary_index
+        self.call_count = 0
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.call_count += 1
+        results = []
+        for i in range(len(texts)):
+            if i < self.boundary_index:
+                results.append([1.0, 0.0, 0.0])  # topic A
+            else:
+                results.append([0.0, 1.0, 0.0])  # topic B
+        return results
+
+    def embed_query(self, text: str) -> list[float]:
+        return [0.0, 0.0, 1.0]
+
+    @property
+    def dimension(self) -> int:
+        return 3
+
+
 def test_heading_grouping():
     doc = _make_doc("# Title\n## 1.1 Section A\ncontent a\n## 1.2 Section B\ncontent b")
     chunker = SemanticChunker()
@@ -66,3 +90,33 @@ def test_chunk_carries_manual_tags():
     chunks = chunker.chunk([doc])
     assert len(chunks) > 0
     assert "自定义标签" in chunks[0].metadata["topic_tags"]
+
+
+def test_semantic_boundary_no_embedder():
+    """Without embedder, _find_semantic_boundaries returns empty."""
+    chunker = SemanticChunker()
+    sentences = [f"Sentence {i}" for i in range(8)]
+    boundaries = chunker._find_semantic_boundaries(sentences)
+    assert boundaries == []
+
+
+def test_semantic_boundary_detection():
+    """With embedder, detects topic shift between sentence groups."""
+    sentences = [f"Sentence {i}" for i in range(8)]
+    chunker = SemanticChunker(embedder=_MockEmbedder(boundary_index=4))
+    boundaries = chunker._find_semantic_boundaries(sentences)
+    assert 4 in boundaries, f"Expected boundary at index 4, got {boundaries}"
+
+
+def test_semantic_chunker_splits_at_boundary():
+    """With embedder, chunks should break at topic boundaries."""
+    topic_a = "区块链是去中心化技术。共识机制确保安全。节点保存完整账本。数据不可篡改。智能合约执行条款。加密算法保护隐私。"
+    topic_b = "人工智能模拟人类智能。机器学习是重要分支。深度学习使用神经网络。自然语言理解语言。计算机识别图像。"
+    text = topic_a + topic_b  # 12 sentences, 6 per topic
+    doc = _make_doc(text)
+    mock = _MockEmbedder(boundary_index=6)
+    chunker = SemanticChunker(embedder=mock)
+    chunks = chunker.chunk([doc], max_chunk_size=50)
+
+    assert len(chunks) >= 2, f"Expected >=2 chunks with semantic boundary, got {len(chunks)}"
+    assert mock.call_count >= 1, "Embedder should have been called"

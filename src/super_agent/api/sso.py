@@ -231,11 +231,14 @@ class SSOMiddleware(BaseHTTPMiddleware):
 
         from super_agent.knowledge.models import UserContext
 
+        doc_level = "L3" if "admin" in roles else "L2"
+
         request.state.user = UserContext(
             user_id=user_id,
             department=department,
             tenant_id="",
             roles=roles,
+            doc_level=doc_level,
         )
         # Also pass username for display purposes
         request.state.username = username
@@ -331,4 +334,5 @@ def register_sso_routes(app: FastAPI) -> None:
             "display_name": str(claims.get("username", "")),
             "roles": roles,
             "department": str(claims.get("dept_id", "")),
+            "doc_level": "L3" if "admin" in roles else "L2",
         }

@@ -61,6 +61,16 @@ class EmbeddingConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SA_EMBEDDING_")
 
 
+class RerankConfig(BaseSettings):
+    """远程 Reranker API 配置。"""
+    provider: Literal["remote", "disabled"] = "disabled"
+    api_url: str = ""
+    api_key: str = ""
+    top_n: int = 0  # 0 = 使用 top_k
+
+    model_config = SettingsConfigDict(env_prefix="SA_RERANK_")
+
+
 class VectorStoreConfig(BaseSettings):
     provider: Literal["chroma", "milvus", "qdrant"] = "chroma"
     chroma_host: str = "localhost"
@@ -142,6 +152,7 @@ class RAGConfig(BaseSettings):
     enable_query_expansion: bool = False  # 查询扩展 → 将 query 扩展为多个同义变体分别检索，扩大召回面（需 LLM 调用，耗时+耗 token）
     enable_intent_classification: bool = True  # 意图分类 → 识别 query 类型（qa/summarize/instruction），用于下游调整生成 prompt
     enable_bm25_hybrid: bool = False  # 启用 ES BM25 混合检索（向量 + 关键词双路 → RRF 融合）
+    enable_llm_tagging: bool = False  # LLM 自动打标：索引时对无 manual_tags 的文档调用 LLM 生成 topic_tags（成本较高）
     chunker_provider: str = "semantic"
     chunker_use_llm: bool = False
     max_chunk_size: int = 500
@@ -202,6 +213,7 @@ class SSOConfig(BaseSettings):
 class Settings(BaseSettings):
     llm: LLMConfig = LLMConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
+    rerank: RerankConfig = RerankConfig()
     vector_store: VectorStoreConfig = VectorStoreConfig()
     redis: RedisConfig = RedisConfig()
     mysql: MySQLConfig = MySQLConfig()
@@ -221,6 +233,7 @@ class Settings(BaseSettings):
         """Re-initialize sub-configs so they pick up env vars at runtime."""
         self.llm = LLMConfig()
         self.embedding = EmbeddingConfig()
+        self.rerank = RerankConfig()
         self.vector_store = VectorStoreConfig()
         self.redis = RedisConfig()
         self.mysql = MySQLConfig()

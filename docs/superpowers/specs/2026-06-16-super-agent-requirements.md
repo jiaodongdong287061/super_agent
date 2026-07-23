@@ -67,13 +67,154 @@ Super Agent — 企业级 AI 应用开发平台
 **目标**：实现三种 Agent 编排模式 + 完整记忆系统
 
 **交付内容**：
-- 任务自动分类器
-- Router + Specialist Agent 模式
-- Plan-and-Execute 模式
-- Supervisor + Multi-Agent 模式
-- 短期记忆（Redis）、长期记忆（MySQL）
+- Guardrails（安全护栏）
+- Classifier（任务分类器）
+- Single Agent Runtime（单 Agent 执行引擎）
+- Skills / RAG / Tools 能力注入层
+- PlanExecute 复杂任务管线
+- MCP Tools 外部工具集成
+- Human Approval Gateway（人工审批网关）
+- Context 管理 + 会话管理
+- 短期记忆（Redis）+ 长期记忆（MySQL）
+- Agent 可观测性（追踪 + 审计 + 指标）
 - 提示词编排引擎
-- LangServe 对外 API
+
+实际企业级不会使用单一模式，通常是如下架构模式：
+                 User
+                  |
+                  v
+
+             Supervisor
+                  |
+                  v
+
+              Router
+
+        +---------+----------+
+        |         |          |
+        v         v          v
+
+    RAG Agent  Tool Agent  Workflow Agent
+
+
+                  |
+                  v
+
+          Plan-and-Execute
+
+
+                  |
+                  v
+
+             Tools
+
+也就是：
+
+Supervisor
+    |
+    |
+ Router
+    |
+ Specialist Agents
+    |
+ Planner
+    |
+ Tools
+
+---
+
+#### 3.2.1 架构选型：从多 Agent 到单 Agent Runtime
+
+##### 初始设计（多 Agent 架构）
+
+以上是企业级 Agent 的经典分层模型，但经过设计评审和实际场景推演后，我们选择了另一种路线。
+
+##### 最终采用（单 Agent Runtime 架构）
+
+```
+                 User
+                  |
+                  |
+              Guardrails
+                  |
+                  |
+              Classifier
+                  |
+                  |
+          Single Agent Runtime
+                  |
+                  |
+      ┌───────────┼───────────┐
+      |           |           |
+    Skills      RAG         Tools
+      |           |           |
+      └───────────┼───────────┘
+                  |
+             PlanExecute
+          (Complex Task Only)
+                  |
+              MCP Tools
+                  |
+        Human Approval Gateway
+                  |
+                  |
+             Execution
+```
+
+##### 两种方案对比
+
+| 对比维度 | 多 Agent 架构（原方案） | 单 Agent Runtime（现方案） |
+|---------|----------------------|--------------------------|
+| **Agent 划分方式** | 写死三类 Specialist（RAG/Tool/Workflow） | 一个 Agent，**按需加载** 能力 |
+| **加新领域** | 加新 Agent + 新路由规则 | 加新 Tool + 新知识库，不改 Agent |
+| **执行路径** | Supervisor → Router → Specialist → Planner → Tools（5 层） | Guardrails → Classifier → Runtime → Tools（3-4 层） |
+| **PlanExecute** | 独立 Agent 模式，始终可用 | Runtime 的**可选管线**，仅复杂任务启用 |
+| **上下文管理** | 多 Agent 各自独立上下文，需要共享机制 | 单上下文统一管理，不存在跨 Agent 共享问题 |
+| **路由决策** | Router + Supervisor 两次重复分类 | Classifier 一次分类，Runtime 直接执行 |
+| **灵活度** | 低：Agent 类型和职责在架构层面确定 | 高：能力由配置决定，架构层面不做假设 |
+| **实现复杂度** | 高：需要实现多 Agent 通信、状态同步 | 低：单循环 + 能力注入 |
+
+##### 选择单 Agent 架构的原因
+
+**1. Agent 的专业度 = 所配的能力，而非写死的类型**
+
+Agent 会什么，取决于运行时挂载了什么 Tools、Skills、RAG 知识库和 MCP 工具。加一个新领域的支持 = 加工具 + 加知识库，不需要新增 Agent 类型，也不需要改路由规则。这比预定义 Specialist RAG/Tool/Workflow 三类 Agent 灵活得多。
+
+**2. 架构链路过深**
+
+原方案 5 层（Supervisor → Router → Specialist → Planner → Tools），每个请求至少过 3 层 LLM 调用。一个简单的 "查 Jenkins 构建日志" 也要走完完整链路，延迟和 Token 成本不必要。
+
+而单 Agent 方案：
+- 纯问答 → 直接 LLM 回答，1 次 LLM 调用
+- 知识查询 → RAG 检索 → LLM 回答，2 次
+- 工具调用 → ReAct 循环，N 次 LLM 调用
+- 复杂任务 → 触发 PlanExecute 管线
+
+按需选择路径，不为简单请求付出复杂代价。
+
+**3. Router 和 Supervisor 职责重叠**
+
+在多 Agent 方案中，Supervisor 负责"全局把控 + 任务分配 + 结果审核"，Router 负责"意图分发"。实际执行中 Supervisor 天然包含路由职能，两者分离会导致两次重复分类判断，增加延迟和出错概率。
+
+单 Agent 方案由 Classifier 一次性完成意图判断，Runtime 直接执行，不存在重叠。
+
+**4. 没有跨 Agent 通信的开销**
+
+多 Agent 方案中 Agent 之间需要共享状态、传递结果，增加了实现复杂度和出错面。单 Agent 方案所有能力在同一个 Runtime 内调度，状态统一管理，不存在通信问题。
+
+##### 三者的关系
+
+原方案的三种模式在单 Agent Runtime 中对应不同的执行路径：
+
+```
+原方案模式              单 Agent Runtime 中的等价路径
+─────────────────────────────────────────────────
+Router + Specialist     → Runtime 加载匹配的 Tools/RAG/Skills → ReAct 循环
+Plan-and-Execute        → Runtime 的 PlanExecute 管线（仅复杂任务启用）
+Supervisor + Multi-Agent → 当前范围外，Phase 3 通过 Workflow 编排实现
+```
+
+Supervisor + Multi-Agent 模式需要的跨 Agent 协作能力，本质上是一个工作流编排问题，归入 Phase 3 的工作流编排范围更合理。Phase 2 聚焦"单 Agent 如何高效完成任务"这一核心问题。
 
 ### 3.3 第三阶段：工具生态与生产化
 
@@ -134,6 +275,7 @@ Super Agent — 企业级 AI 应用开发平台
 - **兜底**：对超过最大 chunk size 的段落，按句子边界二次切分，并在 metadata 中标记"parent_chunk_id"保持关联
 - **标题继承**：切分后每个 chunk 前置完整的标题链（如"1 运维手册 > 1.3 MySQL主从延迟"），标题链参与 embedding 但不计入 chunk size 限制
 - **句子级重叠**：兜底切分时，基于 `overlap_ratio`（默认 0.15，范围 0.05-0.30，可在索引构建时按文档集自定义）控制重叠比例，按句子边界向上取整对齐；不同 chunk_type 默认比例不同（text=0.15, table=0, code=0, list=0.20）；重叠部分在 metadata 中标记 `is_overlap=True` 和 `overlap_source_chunk_id`，检索召回时自动去重
+- **Embedding 语义边界检测**（v2 增强）：在句子级切分过程中，将句子列表批量送入 Embedding API 获取向量，计算相邻句子的余弦相似度。以"均值 − 标准差"为阈值标记语义断点（topic shift），在断点处优先切分 chunk。内置保护规则：不足 5 句不检测、断点间距小于 3 句时合并、断点数量不超过总句数的 40%。无 Embedder 时退回纯规则切分，完全向后兼容
 
 ### 5.3 Metadata 标签体系
 
@@ -227,6 +369,45 @@ Super Agent — 企业级 AI 应用开发平台
 - 多个 Worker Agent 并行或串行处理子任务
 - Supervisor 可要求 Worker 重做或调整输出
 - 支持 Worker 之间的信息共享（通过共享 State）
+
+### 6.5 单 Agent Runtime（实际采用方案）
+
+经过设计评审，实际落地采用单 Agent Runtime 架构代替以上三种模式。详细设计见 `2026-07-23-phase2-partA-agent-core-design.md`。
+
+#### 6.5.1 核心架构
+
+| 组件 | 职责 | 输入 | 输出 |
+|------|------|------|------|
+| Guardrails | 安全护栏：拦截注入/越域/敏感信息 | 用户原始 query | allow / warn / block |
+| Classifier | 意图/风险/复杂度三维分类 | query + 上下文 | {intent, risk, complexity} |
+| Agent Runtime | ReAct 执行循环，按需加载能力 | query + 分类结果 | 最终回答 |
+| Skills | 可复用操作流程（如"MySQL 故障排查流程"） | 参数 + 上下文 | 结构化结果 |
+| RAG | 知识检索 | query + 过滤条件 | 文档 chunks |
+| Tools | 细粒度执行单元（如 mysql_query） | 参数 | 执行结果 |
+| PlanExecute | 复杂任务拆步执行管线 | Plan | 各步执行结果 |
+| MCP Tools | 外部系统集成（MCP 协议） | 参数 | 执行结果 |
+| HITL Gateway | 写操作人工审批 | 工具名 + 参数 | approve / reject |
+
+#### 6.5.2 执行路径
+
+不再固定走某一种 Agent 模式，而是由 Classifier 判断后选择路径：
+
+| 场景 | Classifier 输出 | 执行路径 | LLM 调用次数 |
+|------|----------------|---------|-------------|
+| "什么是主从复制？" | {qa, low, simple} | 直接 LLM 回答 | 1 |
+| "MySQL 延迟怎么排查" | {knowledge, low, simple} | RAG 检索 → LLM 回答 | 2 |
+| "查 Jenkins #123 日志" | {tool, low, simple} | 加载工具 → ReAct 循环 → 回答 | N |
+| "排查并修复 MySQL 延迟" | {complex, high, multi_step} | 加载能力 → PlanExecute → HITL → 回答 | N+M |
+
+#### 6.5.3 与 6.1-6.4 的关系
+
+原方案的三种 Agent 模式不删除，作为设计历程保留。它们在单 Agent 架构中的映射关系：
+
+| 原模式 | 映射到单 Agent 架构 |
+|--------|-------------------|
+| Router + Specialist | Runtime 按需加载匹配的 Tools/RAG/Skills |
+| Plan-and-Execute | Runtime 的内置 PlanExecute 管线（按需启用） |
+| Supervisor + Multi-Agent | 归入 Phase 3 工作流编排 |
 
 ---
 

@@ -48,6 +48,7 @@ class QueryResponse(BaseModel):
 class DeleteRequest(BaseModel):
     chunk_ids: list[str] | None = None
     tenant_id: str = ""
+    department: str = ""
 
 
 class DeleteResponse(BaseModel):
@@ -93,14 +94,31 @@ register_sso_routes(app)
 # ── Core helpers ──────────────────────────────────────────────
 
 
+def _build_reranker():
+    """根据配置构建 Reranker（默认关闭）。"""
+    if settings.rerank.provider != "remote":
+        return None
+    from super_agent.knowledge.remote_reranker import RemoteReranker
+    return RemoteReranker(
+        api_url=settings.rerank.api_url,
+        api_key=settings.rerank.api_key,
+        top_n=settings.rerank.top_n,
+    )
+
+
 def _build_retriever(user: UserContext):
-    """Build retriever based on user context (supports tenant isolation & fan-out)."""
-    from super_agent.knowledge.retriever import Retriever
-    from super_agent.knowledge.fanout_retriever import FanOutRetriever
+    """Build retriever based on user context.
+
+    - 无部门 → 只查公共集合 super_agent_docs
+    - 普通用户 → 查部门集合 + 公共集合（双路 RRF）
+    - 超管 → 查所有部门集合 + 公共集合
+    """
+    from super_agent.knowledge.retriever import Retriever, MultiStoreRetriever
     from super_agent.knowledge.stores import get_store, get_all_tenant_stores
     from super_agent.knowledge.embedders import get_embedder
 
     embedder = get_embedder()
+    reranker = _build_reranker()
 
     es_client = None
     if settings.rag.enable_bm25_hybrid:
@@ -110,15 +128,18 @@ def _build_retriever(user: UserContext):
         except Exception as e:
             logger.warning("ES client init failed, BM25 hybrid disabled: %s", e)
 
-    if user.tenant_id:
-        store = get_store(tenant_id=user.tenant_id)
-        return Retriever(store=store, embedder=embedder, es_client=es_client)
+    public_store = get_store()
 
-    stores = get_all_tenant_stores()
-    if not stores:
-        store = get_store()
-        return Retriever(store=store, embedder=embedder, es_client=es_client)
-    return FanOutRetriever(stores=stores, embedder=embedder)
+    if not user.department:
+        return Retriever(store=public_store, embedder=embedder, reranker=reranker, es_client=es_client)
+
+    if "admin" in user.roles:
+        dept_stores = get_all_tenant_stores()
+        all_stores = [public_store] + dept_stores
+        return MultiStoreRetriever(stores=all_stores, embedder=embedder, es_client=es_client, reranker=reranker)
+
+    dept_store = get_store(tenant_id=user.department)
+    return MultiStoreRetriever(stores=[dept_store, public_store], embedder=embedder, es_client=es_client, reranker=reranker)
 
 
 def _retrieve_chunks(
@@ -220,7 +241,7 @@ async def rag_query(req: QueryRequest, request: Request):
         user = _resolve_user(request, req.user)
         retriever = _build_retriever(user)
 
-        # Query understanding + retrieval
+        # 查询理解 + 检索
         retrieval_timer = RetrievalTimer()
         with retrieval_timer, tracer.start_as_current_span("retrieval") as span:
             chunks = _retrieve_chunks(
@@ -265,7 +286,7 @@ async def rag_query(req: QueryRequest, request: Request):
     elapsed = time.time() - t_start
     logger.info("RAG query completed in %.2fms: %d chunks, %d citations", elapsed * 1000, len(chunks), len(citations))
 
-    # Fire-and-forget audit logging
+    # 异步审计日志（不阻塞主流程）
     try:
         from super_agent.knowledge.audit import AuditLogger
 
@@ -390,7 +411,8 @@ async def rag_batch_query(req: BatchQueryRequest):
 
 
 @app.post("/rag/index")
-async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_id: str = "", use_llm: bool = False):
+async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_id: str = "",
+                     use_llm: bool = False, department: str = "", doc_level: str = "L1"):
     """构建 / 重建知识库索引。
 
     加载 doc_dir 下的文档 → 解析 → 语义切分 → Embed → 写入向量库。
@@ -400,11 +422,10 @@ async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_
         doc_dir: str (默认 "data/raw_docs")  — 文档目录路径
         force: bool (默认 False)              — True = 全量重建（清空 + 重新索引）
                                                  False = 增量索引（跳过哈希未变的文件）
-        tenant_id: str (默认 "")              — 租户标识，指定写入哪个集合
-                                                 空 = 默认集合 super_agent_docs
-                                                 "finance" = 集合 super_agent_docs_finance
+        tenant_id: str (默认 "")              — 租户标识（保留兼容，department 优先）
         use_llm: bool (默认 False)            — True = 使用 LLM 辅助语义切分
-                                                 False = 规则切分（标题链 + 句子级 overlap）
+        department: str (默认 "")             — 部门 ID。空=公共集合，有值=对应部门集合
+        doc_level: str (默认 "L1")            — 文档密级：L1/L2/L3
 
     返回:
         status: str          — "indexed" 或 "rebuilt"
@@ -416,16 +437,18 @@ async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_
     from super_agent.knowledge.embedders import get_embedder
     from super_agent.knowledge.chunkers import SemanticChunker
 
+    embedder = get_embedder()
+
     if use_llm:
         from super_agent.knowledge.chunkers.llm_assisted import LLMAssistedChunker
         chunker = LLMAssistedChunker(use_llm=True)
     else:
-        chunker = SemanticChunker()
+        chunker = SemanticChunker(embedder=embedder)
 
-    store = get_store(tenant_id=tenant_id)
-    embedder = get_embedder()
+    effective_tenant = department or tenant_id
+    store = get_store(tenant_id=effective_tenant)
 
-    # ES BM25 hybrid client
+    # ES BM25 混合检索客户端
     es_client = None
     if settings.rag.enable_bm25_hybrid:
         try:
@@ -434,7 +457,11 @@ async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_
         except Exception as e:
             logger.warning("ES client init failed, BM25 hybrid disabled: %s", e)
 
-    indexer = Indexer(store=store, embedder=embedder, chunker=chunker, tenant_id=tenant_id, es_client=es_client)
+    indexer = Indexer(
+        store=store, embedder=embedder, chunker=chunker,
+        tenant_id=effective_tenant, es_client=es_client,
+        doc_level=doc_level,
+    )
     if force:
         indexer.rebuild(doc_dir)
     else:
@@ -449,7 +476,8 @@ async def rag_delete(req: DeleteRequest):
     参数（DeleteRequest body）:
         chunk_ids: list[str] | None  — 指定要删除的 chunk ID 列表
                                        null = 清空整个集合
-        tenant_id: str (默认 "")      — 租户标识，操作哪个集合
+        tenant_id: str (默认 "")      — 租户标识（保留兼容，department 优先）
+        department: str (默认 "")     — 部门 ID。空=默认集合，有值=对应部门集合
 
     返回:
         status: str          — "ok" 或 "error"
@@ -458,7 +486,8 @@ async def rag_delete(req: DeleteRequest):
     try:
         from super_agent.knowledge.stores import get_store
 
-        store = get_store(tenant_id=req.tenant_id)
+        effective_tenant = req.department or req.tenant_id
+        store = get_store(tenant_id=effective_tenant)
         prev_count = store.count()
 
         if req.chunk_ids:

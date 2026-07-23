@@ -38,6 +38,7 @@ def build_metadata(
     page_numbers: list[int] | None = None,
     heading_path: str = "",
     doc_version: str = "",
+    doc_level: str = "L1",
     allowed_roles: list[str] | None = None,
     allowed_users: list[str] | None = None,
     permission_scope: str = "public",
@@ -45,11 +46,6 @@ def build_metadata(
     doc_status: str = "active",
 ) -> dict:
     tags = resolve_topic_tags(file_path, manual_tags)
-
-    if not department:
-        parts = Path(file_path).parts
-        if len(parts) > 2:
-            department = parts[1]
 
     return {
         "file_path": file_path,
@@ -66,6 +62,7 @@ def build_metadata(
         "page_numbers": page_numbers or [],
         "heading_path": heading_path,
         "doc_version": doc_version,
+        "doc_level": doc_level,
         "allowed_roles": allowed_roles or [],
         "allowed_users": allowed_users or [],
         "permission_scope": permission_scope,

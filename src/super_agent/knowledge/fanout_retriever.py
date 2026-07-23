@@ -9,12 +9,10 @@ from super_agent.knowledge.stores.base import BaseVectorStore
 
 
 class FanOutRetriever:
-    """Cross-tenant retriever that queries multiple tenant collections in parallel
-    and merges results using Reciprocal Rank Fusion (RRF).
+    """跨租户检索器：并行查询多个租户集合，通过 RRF 合并结果。
 
-    Used when no tenant_id is specified (e.g., admin cross-tenant search).
-    Data never exists in a shared collection — each tenant's data stays
-    in its own isolated collection.
+    用于未指定 tenant_id 的场景（如管理员跨租户搜索）。
+    每个租户的数据始终存储在自己的独立集合中，不混入公共集合。
     """
 
     def __init__(self, stores: list[BaseVectorStore], embedder: BaseEmbedder):
@@ -33,7 +31,7 @@ class FanOutRetriever:
 
         query_emb = self.embedder.embed_query(query)
 
-        # Parallel query across all tenant stores
+        # 并行查询所有租户的向量库
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.stores)) as pool:
             futures = [
                 pool.submit(self._search_store, store, query_emb, top_k, filters)
@@ -41,10 +39,10 @@ class FanOutRetriever:
             ]
             all_results = [f.result() for f in concurrent.futures.as_completed(futures)]
 
-        # Merge with RRF
+        # 用 RRF 合并结果
         merged = reciprocal_rank_fusion(*all_results, k=60)
 
-        # Deduplicate overlap chunks
+        # 去重重叠 chunk
         merged = deduplicate_overlaps(merged)
 
         return [r.chunk for r in merged[:top_k]]

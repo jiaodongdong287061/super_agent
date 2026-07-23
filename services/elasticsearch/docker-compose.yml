@@ -1,0 +1,37 @@
+services:
+  elasticsearch:
+    build: .
+    container_name: super-agent-es
+    ports:
+      - "31242:9200"
+      - "31243:9300"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms4g -Xmx4g
+      - cluster.name=super-agent
+      - indices.memory.index_buffer_size=10%
+      - thread_pool.search.queue_size=1000
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    deploy:
+      resources:
+        limits:
+          memory: 6g
+        reservations:
+          memory: 2g
+    networks:
+      - super-agent-net
+    restart: unless-stopped
+    healthcheck:
+      test: curl -s http://localhost:9200 >/dev/null 2>&1
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  es-data:
+
+networks:
+  super-agent-net:
+    driver: bridge

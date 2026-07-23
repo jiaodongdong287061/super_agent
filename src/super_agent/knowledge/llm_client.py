@@ -161,7 +161,7 @@ class LLMClient:
                         content = delta.get("content", "")
                         if content:
                             yield content
-                    return  # stream completed normally
+                    return  # 流式输出正常结束
             except (httpx.TimeoutException, httpx.ConnectError) as e:
                 last_exc = e
                 if attempt < self.retry_max:

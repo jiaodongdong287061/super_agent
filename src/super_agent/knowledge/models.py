@@ -18,6 +18,7 @@ class MetadataSchema:
     page_numbers: list[int] = field(default_factory=list)
     heading_path: str = ""
     doc_version: str = ""
+    doc_level: str = "L1"
     allowed_roles: list[str] = field(default_factory=list)
     allowed_users: list[str] = field(default_factory=list)
     permission_scope: str = "public"
@@ -74,3 +75,4 @@ class UserContext:
     roles: list[str] = field(default_factory=list)
     department: str = ""
     tenant_id: str = ""
+    doc_level: str = "L2"
