@@ -51,16 +51,22 @@ class LLMAssistedChunker(BaseChunker):
         sections = self._split_by_headings(text)
 
         chunks: list[Chunk] = []
+        search_pos = 0
         for heading_chain, content in sections:
             content = content.strip()
             if not content:
                 continue
+            content_start = text.find(content, search_pos)
+            if content_start >= 0:
+                search_pos = content_start + len(content)
+
             tokens = estimate_tokens(content)
             if tokens <= max_chunk_size:
-                chunks.append(self._make_chunk(content, heading_chain, source, doc.metadata))
+                chunks.append(self._make_chunk(content, heading_chain, source, doc.metadata, char_start=content_start))
             else:
                 sub_chunks = self._split_large_section(
-                    content, heading_chain, source, doc.metadata, max_chunk_size, overlap_ratio
+                    content, heading_chain, source, doc.metadata, max_chunk_size, overlap_ratio,
+                    section_start=content_start if content_start >= 0 else 0,
                 )
                 chunks.extend(sub_chunks)
 
@@ -78,32 +84,47 @@ class LLMAssistedChunker(BaseChunker):
         source: str,
         doc_meta: dict,
         max_chunk_size: int,
-        overlap_ratio: float | None,
+        section_start: int = 0,
     ) -> list[Chunk]:
         sentences = split_sentences(content)
         if len(sentences) < 2:
             return self.fallback._split_large_section(
-                content, heading_chain, source, doc_meta, max_chunk_size, overlap_ratio
+                content, heading_chain, source, doc_meta, max_chunk_size, overlap_ratio,
+                section_start=section_start,
             )
 
         split_points = self._suggest_split_points(sentences)
         if not split_points:
             return self.fallback._split_large_section(
-                content, heading_chain, source, doc_meta, max_chunk_size, overlap_ratio
+                content, heading_chain, source, doc_meta, max_chunk_size, overlap_ratio,
+                section_start=section_start,
             )
+
+        # 预计算句子偏移
+        sent_positions: list[int] = []
+        search_from = 0
+        for sent in sentences:
+            pos = content.find(sent, search_from)
+            sent_positions.append(pos if pos >= 0 else search_from)
+            search_from = (pos if pos >= 0 else search_from) + len(sent)
 
         segments = self._apply_split_points(sentences, split_points, max_chunk_size)
 
         chunks: list[Chunk] = []
+        sent_idx = 0
         for seg_text in segments:
+            char_start = section_start + (sent_positions[sent_idx] if sent_idx < len(sent_positions) else 0)
             if estimate_tokens(seg_text) > max_chunk_size:
-                # 递归兜底：超过 max_chunk_size 的段 fallback 到规则切分
                 sub_chunks = self.fallback._split_large_section(
-                    seg_text, heading_chain, source, doc_meta, max_chunk_size, overlap_ratio
+                    seg_text, heading_chain, source, doc_meta, max_chunk_size, overlap_ratio,
+                    section_start=char_start,
                 )
                 chunks.extend(sub_chunks)
             else:
-                chunks.append(self._make_chunk(seg_text, heading_chain, source, doc_meta))
+                chunks.append(self._make_chunk(seg_text, heading_chain, source, doc_meta, char_start=char_start))
+            # 推进 sent_idx：统计该 segment 包含的句子数
+            n_sents = len(split_sentences(seg_text))
+            sent_idx += n_sents
         return chunks
 
     def _suggest_split_points(self, sentences: list[str]) -> list[int]:
@@ -150,7 +171,7 @@ class LLMAssistedChunker(BaseChunker):
         return segments
 
     def _make_chunk(
-        self, content: str, heading_chain: str, source: str, doc_meta: dict
+        self, content: str, heading_chain: str, source: str, doc_meta: dict, char_start: int = 0
     ) -> Chunk:
         full_text = f"{heading_chain}\n{content}" if heading_chain else content
         manual_tags = doc_meta.get("manual_tags")
@@ -167,4 +188,5 @@ class LLMAssistedChunker(BaseChunker):
             full_text=full_text,
             metadata=meta,
             page_numbers=page_nums,
+            char_start=char_start,
         )

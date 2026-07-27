@@ -48,16 +48,23 @@ class SemanticChunker(BaseChunker):
         sections = self._split_by_headings(text)
 
         chunks: list[Chunk] = []
+        search_pos = 0
         for heading_chain, content in sections:
             content = content.strip()
             if not content:
                 continue
+            # 在全文中的起始位置
+            content_start = text.find(content, search_pos)
+            if content_start >= 0:
+                search_pos = content_start + len(content)
+
             tokens = estimate_tokens(content)
             if tokens <= max_chunk_size:
-                chunks.append(self._make_chunk(content, heading_chain, source, doc.metadata))
+                chunks.append(self._make_chunk(content, heading_chain, source, doc.metadata, char_start=content_start))
             else:
                 sub_chunks = self._split_large_section(
-                    content, heading_chain, source, doc.metadata, max_chunk_size, overlap_ratio
+                    content, heading_chain, source, doc.metadata, max_chunk_size, overlap_ratio,
+                    section_start=content_start if content_start >= 0 else 0,
                 )
                 chunks.extend(sub_chunks)
 
@@ -171,8 +178,21 @@ class SemanticChunker(BaseChunker):
         doc_meta: dict,
         max_chunk_size: int,
         overlap_ratio: float | None,
+        section_start: int = 0,
     ) -> list[Chunk]:
         sentences = split_sentences(content)
+
+        # 预计算每句在 content 中的起始字符偏移（用于页码归属）
+        sent_positions: list[int] = []
+        search_from = 0
+        for sent in sentences:
+            pos = content.find(sent, search_from)
+            if pos >= 0:
+                sent_positions.append(pos)
+                search_from = pos + len(sent)
+            else:
+                sent_positions.append(search_from)
+
         # 确保单句不超过 max_chunk_size
         sentences = [
             piece
@@ -193,6 +213,9 @@ class SemanticChunker(BaseChunker):
         current_tokens = 0
         overlap_sentences: list[str] = []
 
+        # 追踪当前 chunk 的首句在原始 sent_positions 中的索引
+        chunk_first_sent_idx = 0
+
         for sent_idx, sent in enumerate(sentences):
             sent_tokens = estimate_tokens(sent)
             force_flush = (
@@ -201,8 +224,9 @@ class SemanticChunker(BaseChunker):
                 and current_sentences
             )
             if current_tokens + sent_tokens > max_chunk_size and current_sentences:
+                char_start = section_start + (sent_positions[chunk_first_sent_idx] if chunk_first_sent_idx < len(sent_positions) else 0)
                 chunk_text = " ".join(current_sentences)
-                c = self._make_chunk(chunk_text, heading_chain, source, doc_meta)
+                c = self._make_chunk(chunk_text, heading_chain, source, doc_meta, char_start=char_start)
                 if overlap_sentences:
                     c.is_overlap = True
                     c.overlap_source_chunk_id = chunks[-1].id if chunks else None
@@ -219,9 +243,11 @@ class SemanticChunker(BaseChunker):
                     overlap_count += st
                 current_sentences = list(overlap_sentences)
                 current_tokens = overlap_count
+                chunk_first_sent_idx = sent_idx
             elif force_flush:
+                char_start = section_start + (sent_positions[chunk_first_sent_idx] if chunk_first_sent_idx < len(sent_positions) else 0)
                 chunk_text = " ".join(current_sentences)
-                c = self._make_chunk(chunk_text, heading_chain, source, doc_meta)
+                c = self._make_chunk(chunk_text, heading_chain, source, doc_meta, char_start=char_start)
                 if overlap_sentences:
                     c.is_overlap = True
                     c.overlap_source_chunk_id = chunks[-1].id if chunks else None
@@ -238,12 +264,14 @@ class SemanticChunker(BaseChunker):
                     overlap_count += st
                 current_sentences = list(overlap_sentences)
                 current_tokens = overlap_count
+                chunk_first_sent_idx = sent_idx
             current_sentences.append(sent)
             current_tokens += estimate_tokens(sent)
 
         if current_sentences:
+            char_start = section_start + (sent_positions[chunk_first_sent_idx] if chunk_first_sent_idx < len(sent_positions) else 0)
             chunk_text = " ".join(current_sentences)
-            c = self._make_chunk(chunk_text, heading_chain, source, doc_meta)
+            c = self._make_chunk(chunk_text, heading_chain, source, doc_meta, char_start=char_start)
             if overlap_sentences and chunks:
                 c.is_overlap = True
                 c.overlap_source_chunk_id = chunks[-1].id
@@ -252,7 +280,7 @@ class SemanticChunker(BaseChunker):
         return chunks
 
     def _make_chunk(
-        self, content: str, heading_chain: str, source: str, doc_meta: dict
+        self, content: str, heading_chain: str, source: str, doc_meta: dict, char_start: int = 0
     ) -> Chunk:
         full_text = f"{heading_chain}\n{content}" if heading_chain else content
         manual_tags = doc_meta.get("manual_tags")
@@ -270,4 +298,5 @@ class SemanticChunker(BaseChunker):
             full_text=full_text,
             metadata=meta,
             page_numbers=page_nums,
+            char_start=char_start,
         )

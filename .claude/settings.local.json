@@ -49,7 +49,25 @@
       "Bash(wmic process *)",
       "Bash(SA_SERVER_PORT=8001 uv run uvicorn super_agent.main:app --port 8001 --log-level info)",
       "WebSearch",
-      "WebFetch(domain:docs.bigmodel.cn)"
+      "WebFetch(domain:docs.bigmodel.cn)",
+      "Bash(powershell.exe -Command \"Get-Process -Id 30336 -ErrorAction SilentlyContinue | Format-List Id,ProcessName,SessionId\")",
+      "Bash(tasklist /FI \"PID eq 30336\")",
+      "Bash(uv pip *)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(rm uv.lock)",
+      "Bash(uv lock *)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(taskkill /F /IM python.exe)",
+      "Bash(taskkill /F /IM python3.exe)",
+      "Bash(cd /d \"D:\\\\workspace\\\\jdd\\\\创新项目组\\\\IT运维数字员工\\\\super_agent\")",
+      "Bash(attrib -R .venv\\\\* /S)",
+      "Bash(cmd.exe /c \"rmdir /S /Q .venv 2>&1\")",
+      "Bash(handle -a -p \"D:\\\\workspace\\\\jdd\\\\创新项目组\\\\IT运维数字员工\\\\super_agent\\\\.venv\")",
+      "Bash(ls .venv/Scripts/uvicorn.exe)",
+      "Bash(ls \".venv/Lib/site-packages/_cffi_backend.cp312-win_amd64.pyd\")",
+      "Bash(cmd.exe *)",
+      "Bash(uv venv *)",
+      "Bash(taskkill //IM uvicorn.exe //F)"
     ]
   }
 }

@@ -8,7 +8,7 @@ services:
     ports:
       - "31241:8001"
     environment:
-      - FE_DEVICE=cpu
+      - FE_DEVICE=cuda
       - FE_EMBED_MODEL=/app/models/bge-m3
       - FE_RERANK_MODEL=/app/models/bge-reranker-v2-m3
       - FE_EMBED_DIM=1024
@@ -26,3 +26,12 @@ services:
         max-size: "100m"
         max-file: "3"
     restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids:
+                - "GPU-07f30641-8cc3-5853-29d7-7ccb43d17acf"
+              capabilities: [ gpu ]
+

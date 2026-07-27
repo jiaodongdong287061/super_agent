@@ -229,6 +229,12 @@ class SSOMiddleware(BaseHTTPMiddleware):
         else:
             roles = [str(roles_raw)]
 
+        permissions_raw = claims.get("role_permission", [])
+        if isinstance(permissions_raw, list):
+            permissions = [str(p) for p in permissions_raw]
+        else:
+            permissions = [str(permissions_raw)]
+
         from super_agent.knowledge.models import UserContext
 
         doc_level = "L3" if "admin" in roles else "L2"
@@ -239,6 +245,7 @@ class SSOMiddleware(BaseHTTPMiddleware):
             tenant_id="",
             roles=roles,
             doc_level=doc_level,
+            permissions=permissions,
         )
         # Also pass username for display purposes
         request.state.username = username
@@ -328,11 +335,18 @@ def register_sso_routes(app: FastAPI) -> None:
         else:
             roles = [str(roles_raw)]
 
+        permissions_raw = claims.get("role_permission", [])
+        if isinstance(permissions_raw, list):
+            permissions = [str(p) for p in permissions_raw]
+        else:
+            permissions = [str(permissions_raw)]
+
         return {
             "user_id": str(claims.get("user_id", "")),
             "username": str(claims.get("username", "")),
             "display_name": str(claims.get("username", "")),
             "roles": roles,
+            "permissions": permissions,
             "department": str(claims.get("dept_id", "")),
             "doc_level": "L3" if "admin" in roles else "L2",
         }

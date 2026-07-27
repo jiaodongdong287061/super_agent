@@ -38,6 +38,7 @@ class Chunk:
     overlap_ratio: float = 0.0
     sibling_chunk_ids: list[str] = field(default_factory=list)
     page_numbers: list[int] = field(default_factory=list)
+    char_start: int = 0  # 在原始 Document 文本中的起始字符偏移，用于页码归属
 
 
 @dataclass
@@ -76,3 +77,4 @@ class UserContext:
     department: str = ""
     tenant_id: str = ""
     doc_level: str = "L2"
+    permissions: list[str] = field(default_factory=list)  # 从 SSO JWT claims["role_permission"] 获取

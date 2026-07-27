@@ -24,8 +24,7 @@ def _check_paddleocr() -> bool:
             _PADDLEOCR_AVAILABLE = False
             logger.warning(
                 "paddleocr is not available. Scanned PDF pages will be skipped. "
-                "Install with: uv sync --extra ml",
-                exc_info=True,
+                "Install with: uv sync --extra ml"
             )
     return _PADDLEOCR_AVAILABLE
 
@@ -47,7 +46,7 @@ class PDFLoader(BaseLoader):
         pdf = fitz.open(source)
         page_docs = self._extract_pages(pdf, source)
         pdf.close()
-        return self._merge_cross_page_tables(page_docs)
+        return self._merge_all_pages(page_docs)
 
     def _extract_pages(self, pdf, source: str) -> list[tuple[str, int, bool]]:
         """提取每一页的内容，返回 (文本, 页码, 是否跨页).
@@ -81,41 +80,39 @@ class PDFLoader(BaseLoader):
             )
         return pages
 
-    def _merge_cross_page_tables(
-        self, pages: list[tuple[str, int, bool]]
+    def _merge_all_pages(
+        self, pages: list[tuple[str, int, bool]], group_size: int = 5
     ) -> list[Document]:
-        """合并跨页的表格：连续页中 table_continues=True 的表合并为一个文档。"""
+        """按 group_size 页一组合并为多个 Document，保留各页结束偏移用于 chunk 页码归属。
+
+        每页文本用 \n\n 拼接，metadata 记录 page_end_offsets（组内各页结束的字符位置）。
+        group_size=5 表示每 5 页合并为一个 Document，语义切割在 5 页范围内生效。
+        """
         if not pages:
             return []
 
         docs: list[Document] = []
-        accumulated_texts: list[str] = []
-        accumulated_page_nums: list[int] = []
+        for group_start in range(0, len(pages), group_size):
+            group = pages[group_start : group_start + group_size]
+            texts = [text for text, _, _ in group]
+            full_text = "\n\n".join(texts)
 
-        for text, page_num, table_continues in pages:
-            accumulated_texts.append(text)
-            accumulated_page_nums.append(page_num)
-            if not table_continues:
-                docs.append(
-                    Document(
-                        page_content="\n\n".join(accumulated_texts),
-                        metadata={
-                            "source": "pdf",
-                            "page_numbers": list(accumulated_page_nums),
-                        },
-                    )
-                )
-                accumulated_texts = []
-                accumulated_page_nums = []
+            # 计算组内每页结束的字符偏移
+            page_end_offsets: list[int] = []
+            pos = 0
+            for i, (text, _, _) in enumerate(group):
+                pos += len(text)
+                page_end_offsets.append(pos)
+                if i < len(group) - 1:
+                    pos += 2  # "\n\n"
 
-        # 清空剩余的累积页
-        if accumulated_texts:
             docs.append(
                 Document(
-                    page_content="\n\n".join(accumulated_texts),
+                    page_content=full_text,
                     metadata={
                         "source": "pdf",
-                        "page_numbers": list(accumulated_page_nums),
+                        "page_numbers": [pn for _, pn, _ in group],
+                        "page_end_offsets": page_end_offsets,
                     },
                 )
             )

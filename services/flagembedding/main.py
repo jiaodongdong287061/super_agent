@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 DEVICE: str = os.getenv("FE_DEVICE", "cpu")  # "cpu" or "cuda" or "cuda:0"
 EMBED_MODEL: str = os.getenv("FE_EMBED_MODEL", "BAAI/bge-m3")
 RERANK_MODEL: str = os.getenv("FE_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
-EMBED_DIM: int = int(os.getenv("FE_EMBED_DIM", "2048"))  # 0 = 模型原生维度（BGE-M3 原生 1024）
-# BGE-M3 支持 truncate_dim，可设为 1024/2048/4096
+EMBED_DIM: int = int(os.getenv("FE_EMBED_DIM", "1024"))  # 0 = 模型原生维度（BGE-M3 原生 1024）
+# BGE-M3 支持 truncate_dim，最大 1024，设为 0 使用模型原生维度
 # BGE-large-zh-v1.5 固定 1024，设此值无效
 HOST: str = os.getenv("FE_HOST", "0.0.0.0")
 PORT: int = int(os.getenv("FE_PORT", "8001"))

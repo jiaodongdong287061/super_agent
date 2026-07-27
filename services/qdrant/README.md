@@ -6,6 +6,7 @@
 
 ```bash
 cd services/qdrant
+export QDRANT_API_KEY=7s9kP2RgT5xQz8bNvDcF4mLjh0Y6aUwG1e
 docker compose up -d
 ```
 
@@ -17,6 +18,8 @@ curl http://localhost:31243/health
 
 # 查看集合列表
 curl http://localhost:31243/collections
+curl -H "api-key: 7s9kP2RgT5xQz8bNvDcF4mLjh0Y6aUwG1e" http://10.1.1.19:31244/collections
+curl -H "api-key: 7s9kP2RgT5xQz8bNvDcF4mLjh0Y6aUwG1e" http://10.1.1.19:31244/collections/super_agent_docs_105
 ```
 
 ## 配置
@@ -34,7 +37,7 @@ SA_VECTOR_PROVIDER=qdrant
 SA_VECTOR_QDRANT_URL=http://localhost:31243
 SA_VECTOR_QDRANT_API_KEY=your-api-key
 SA_VECTOR_QDRANT_COLLECTION=super_agent_docs
-SA_VECTOR_QDRANT_VECTOR_SIZE=2048
+SA_VECTOR_QDRANT_VECTOR_SIZE=1024
 SA_VECTOR_QDRANT_DISTANCE=COSINE
 ```
 

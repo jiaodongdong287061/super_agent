@@ -102,6 +102,8 @@ class ESClient:
         if actions:
             client.bulk(operations=actions, refresh=False)
 
+        logger.info("ES indexed %d chunks -> %s", len(batch), index)
+
     # ── 检索 ──────────────────────────────────────────────
 
     def search(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:

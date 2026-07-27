@@ -75,6 +75,9 @@ class BatchQueryResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=getattr(logging, settings.server.log_level))
+    # 压制 httpx/httpcore 的 DEBUG 日志（太吵）
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     setup_tracing()
     logger.info("Super Agent starting in %s mode", settings.env)
     yield
@@ -214,6 +217,8 @@ async def metrics():
 
 @app.post("/rag/query", response_model=QueryResponse)
 async def rag_query(req: QueryRequest, request: Request):
+    logger.info("POST /rag/query query=%s top_k=%s filters=%s",
+                req.query[:100], req.top_k, req.filters)
     """RAG 检索 + LLM 答案生成。
 
     流程：Query 改写 → Embed → 向量检索 → (可选 BM25 + RRF) → (可选 Rerank) → LLM 生成答案 → 审计日志
@@ -308,6 +313,7 @@ async def rag_query(req: QueryRequest, request: Request):
 
 @app.post("/rag/query/stream")
 async def rag_query_stream(req: QueryRequest, request: Request):
+    logger.info("POST /rag/query/stream query=%s top_k=%s", req.query[:100], req.top_k)
     """SSE 流式 RAG 检索 + 答案生成。
 
     与 /rag/query 功能相同，但 LLM 生成部分以 SSE 流式输出。
@@ -352,6 +358,7 @@ async def rag_query_stream(req: QueryRequest, request: Request):
 
 @app.post("/rag/batch-query", response_model=BatchQueryResponse)
 async def rag_batch_query(req: BatchQueryRequest):
+    logger.info("POST /rag/batch-query queries=%d", len(req.queries))
     """批量 RAG 检索 + 答案生成。
 
     同时执行多个 query 的检索和生成，适合一次问多个问题、或分块文档场景。
@@ -413,6 +420,8 @@ async def rag_batch_query(req: BatchQueryRequest):
 @app.post("/rag/index")
 async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_id: str = "",
                      use_llm: bool = False, department: str = "", doc_level: str = "L1"):
+    logger.info("POST /rag/index doc_dir=%s force=%s tenant_id=%s department=%s doc_level=%s",
+                doc_dir, force, tenant_id, department, doc_level)
     """构建 / 重建知识库索引。
 
     加载 doc_dir 下的文档 → 解析 → 语义切分 → Embed → 写入向量库。
@@ -471,6 +480,8 @@ async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_
 
 @app.post("/rag/delete", response_model=DeleteResponse)
 async def rag_delete(req: DeleteRequest):
+    logger.info("POST /rag/delete chunk_ids=%s tenant_id=%s department=%s",
+                len(req.chunk_ids) if req.chunk_ids else None, req.tenant_id, req.department)
     """删除或清空向量库中的文档块。
 
     参数（DeleteRequest body）:
@@ -504,6 +515,7 @@ async def rag_delete(req: DeleteRequest):
 
 @app.post("/rag/doc/status")
 async def rag_doc_status(doc_path: str, tenant_id: str = ""):
+    logger.info("POST /rag/doc/status doc_path=%s tenant_id=%s", doc_path, tenant_id)
     """查询指定文档的索引状态（版本、哈希、最近索引时间）。
 
     参数:
@@ -533,6 +545,7 @@ async def rag_doc_status(doc_path: str, tenant_id: str = ""):
 
 @app.post("/rag/doc/list")
 async def rag_doc_list(tenant_id: str = ""):
+    logger.info("POST /rag/doc/list tenant_id=%s", tenant_id)
     """列出指定租户下所有已索引的文档及其版本信息。
 
     参数:

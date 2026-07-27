@@ -138,7 +138,7 @@ class MultiStoreRetriever:
         store_results: list[list[SearchResult]] = []
         for store in self.stores:
             vector_results = store.search(query_emb, top_k * 3, merged_filters)
-            store_results.append([SearchResult(chunk=c, score=1.0) for c in vector_results])
+            store_results.append(vector_results)
 
         if len(store_results) > 1:
             vector_ranked = reciprocal_rank_fusion(*store_results, k=60)

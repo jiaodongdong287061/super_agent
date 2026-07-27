@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -88,13 +89,37 @@ class Indexer:
                 doc.metadata["doc_level"] = self.doc_level
 
             chunks = self.chunker.chunk(documents, **kwargs)
+            logger.info("File %s → %d chunks", rel_path, len(chunks))
+
+            # 将 char_start 映射为实际页码
+            self._attribute_page_numbers(chunks, documents)
 
             if chunks:
-                texts = [c.full_text for c in chunks]
-                embeddings = self.embedder.embed_texts(texts)
-                self.store.add(chunks, embeddings)
-                if self.es_client:
-                    self.es_client.add(chunks)
+                # 并发 embedding + 写库：每批独立提交，提高大文件索引速度
+                batch_size = 64
+                total = len(chunks)
+                batches = [chunks[i:i + batch_size] for i in range(0, total, batch_size)]
+
+                def _process_batch(batch_idx: int, batch_chunks: list) -> int:
+                    texts = [c.full_text for c in batch_chunks]
+                    embeddings = self.embedder.embed_texts(texts)
+                    self.store.add(batch_chunks, embeddings)
+                    if self.es_client:
+                        self.es_client.add(batch_chunks)
+                    return batch_idx
+
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = {
+                        executor.submit(_process_batch, i, b): i
+                        for i, b in enumerate(batches)
+                    }
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        future.result()  # 抛出异常则中断
+                        logger.info(
+                            "Indexed batch [%d/%d] for %s",
+                            idx + 1, len(batches), rel_path,
+                        )
 
             state[rel_path] = {
                 "hash": file_hash,
@@ -159,6 +184,24 @@ class Indexer:
 
     def _save_state(self, state: dict) -> None:
         self.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _attribute_page_numbers(chunks: list, documents: list) -> None:
+        """用 chunk.char_start 对比 page_end_offsets 反算该 chunk 的实际页码。"""
+        for chunk in chunks:
+            offsets = chunk.metadata.get("page_end_offsets")
+            page_nums = chunk.metadata.get("page_numbers")
+            if not offsets or not page_nums:
+                continue
+            char_end = chunk.char_start + len(chunk.content)
+            pages = []
+            prev = 0
+            for i, end in enumerate(offsets):
+                if chunk.char_start < end and char_end > prev:
+                    pages.append(page_nums[i])
+                prev = end
+            if pages:
+                chunk.page_numbers = pages
 
     @staticmethod
     def _file_hash(path: Path) -> str:

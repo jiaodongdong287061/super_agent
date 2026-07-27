@@ -2,7 +2,7 @@
 
 独立部署的 FastAPI 服务，提供 OpenAI 兼容的 Embedding API 和 Reranker API。
 
-默认使用 **BAAI/bge-m3**（Embedding，2048 维）和 **BAAI/bge-reranker-v2-m3**（Reranker），
+默认使用 **BAAI/bge-m3**（Embedding，1024 维）和 **BAAI/bge-reranker-v2-m3**（Reranker），
 CPU / GPU 均可运行。
 
 ## 配置（环境变量）
@@ -12,16 +12,15 @@ CPU / GPU 均可运行。
 | `FE_DEVICE` | `cpu` | 运行设备：`cpu` / `cuda` / `cuda:0` |
 | `FE_EMBED_MODEL` | `BAAI/bge-m3` | Embedding 模型名 |
 | `FE_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | Reranker 模型名 |
-| `FE_EMBED_DIM` | `2048` | Embedding 维度（BGE-M3 支持 1024/2048/4096） |
+| `FE_EMBED_DIM` | `1024` | Embedding 维度（BGE-M3 原生 1024，设为 0 使用模型默认值） |
 | `FE_HOST` | `0.0.0.0` | 监听地址 |
 | `FE_PORT` | `8001` | 监听端口 |
 | `FE_LOG_LEVEL` | `INFO` | 日志级别 |
 
 ### BGE-M3 维度说明
 
-BGE-M3 支持 `truncate_dim` 参数，可直接输出 1024/2048/4096 维向量，
-无需加载多个模型。如果你的 Qdrant 集合是 2048 维（`SA_VECTOR_QDRANT_VECTOR_SIZE=2048`），
-保持 `FE_EMBED_DIM=2048`，**无需重建索引**。
+BGE-M3 原生输出 1024 维向量，不支持 truncate_dim 扩展维度。
+Qdrant 集合维度（`SA_VECTOR_QDRANT_VECTOR_SIZE`）必须设为 1024 以保持一致。
 
 ### CPU 资源
 
@@ -43,7 +42,7 @@ GET /health
   "device": "cpu",
   "embed_model": "BAAI/bge-m3",
   "rerank_model": "BAAI/bge-reranker-v2-m3",
-  "embed_dim": 2048
+  "embed_dim": 1024
 }
 ```
 
@@ -103,7 +102,7 @@ docker run -d \
   -e FE_DEVICE=cpu \
   -e FE_EMBED_MODEL=BAAI/bge-m3 \
   -e FE_RERANK_MODEL=BAAI/bge-reranker-v2-m3 \
-  -e FE_EMBED_DIM=2048 \
+  -e FE_EMBED_DIM=1024 \
   -v flagembedding-cache:/root/.cache/huggingface \
   flagembedding-service
 ```
@@ -121,7 +120,7 @@ docker run -d \
   -e FE_DEVICE=cuda \
   -e FE_EMBED_MODEL=BAAI/bge-m3 \
   -e FE_RERANK_MODEL=BAAI/bge-reranker-v2-m3 \
-  -e FE_EMBED_DIM=2048 \
+  -e FE_EMBED_DIM=1024 \
   -v flagembedding-cache:/root/.cache/huggingface \
   flagembedding-service
 ```
@@ -143,7 +142,7 @@ services:
       - FE_DEVICE=cpu
       - FE_EMBED_MODEL=BAAI/bge-m3
       - FE_RERANK_MODEL=BAAI/bge-reranker-v2-m3
-      - FE_EMBED_DIM=2048
+      - FE_EMBED_DIM=1024
     volumes:
       - flagembedding-cache:/root/.cache/huggingface
 

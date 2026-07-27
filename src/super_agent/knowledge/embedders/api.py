@@ -17,7 +17,6 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 def sanitize_text(text: str) -> str:
     """去除可能导致 API 拒绝的控制字符。"""
     text = _CONTROL_CHAR_RE.sub("", text)
-    # 将多个空白符合并为一个空格
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
 
@@ -29,49 +28,56 @@ class APIEmbedder(BaseEmbedder):
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         cfg = settings.embedding
         all_embeddings: list[list[float]] = []
-        max_input_chars = 4000  # ~4000 Chinese tokens, safe for most embedding APIs
+        max_input_chars = 4000
+        batch_size = cfg.api_batch_size
 
         masked_key = cfg.api_key[:8] + "..." if cfg.api_key else ""
 
-        for i, text in enumerate(texts):
-            if not text or not text.strip():
-                logger.warning("Skipping empty text at index %d", i)
+        # 按 batch 分组处理
+        for batch_idx in range(0, len(texts), batch_size):
+            batch_texts = texts[batch_idx : batch_idx + batch_size]
+            cleaned_batch = []
+            for t in batch_texts:
+                if not t or not t.strip():
+                    continue
+                cleaned = sanitize_text(t)
+                if not cleaned:
+                    continue
+                if len(cleaned) > max_input_chars:
+                    cleaned = cleaned[:max_input_chars]
+                cleaned_batch.append(cleaned)
+
+            if not cleaned_batch:
                 continue
 
-            cleaned = sanitize_text(text)
-            if not cleaned:
-                logger.warning("Skipping text at index %d after sanitization (became empty)", i)
-                continue
-
-            # 截断超长输入，避免 API token 限制
-            if len(cleaned) > max_input_chars:
-                logger.warning(
-                    "Truncating text at index %d from %d to %d chars",
-                    i, len(cleaned), max_input_chars,
-                )
-                cleaned = cleaned[:max_input_chars]
-
-            payload = {"model": cfg.api_model, "input": cleaned}
+            payload = {"model": cfg.api_model, "input": cleaned_batch}
             logger.info(
-                "Embedding request [%d/%d]: model=%s key=%s input_len=%d preview=%s",
-                i + 1, len(texts), cfg.api_model, masked_key, len(cleaned), cleaned[:80],
+                "Embedding batch [%d/%d]: size=%d model=%s",
+                batch_idx // batch_size + 1,
+                (len(texts) + batch_size - 1) // batch_size,
+                len(cleaned_batch),
+                cfg.api_model,
             )
+
+            headers = {}
+            if cfg.api_key:
+                headers["Authorization"] = f"Bearer {cfg.api_key}"
+
             resp = httpx.post(
                 f"{cfg.api_url}",
                 json=payload,
-                headers={"Authorization": f"Bearer {cfg.api_key}"},
-                timeout=60.0,
+                headers=headers,
+                timeout=120.0,
             )
             if resp.status_code >= 400:
                 logger.error(
-                    "Embedding API error [%s] at index %d: %s\n  preview=%s",
+                    "Embedding API error [%s] at batch %d: %s",
                     resp.status_code,
-                    i,
-                    resp.text,
-                    cleaned[:200],
+                    batch_idx // batch_size,
+                    resp.text[:200],
                 )
                 raise RuntimeError(
-                    f"Embedding API returned {resp.status_code} at index {i}: {resp.text}"
+                    f"Embedding API returned {resp.status_code} at batch {batch_idx // batch_size}: {resp.text[:200]}"
                 )
             resp.raise_for_status()
             data = resp.json()["data"]
