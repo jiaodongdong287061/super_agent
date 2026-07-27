@@ -43,13 +43,57 @@ class Indexer:
     @traceable(name="indexer.build", run_type="chain")
     def build(self, doc_dir: str, file_tags: dict[str, list[str]] | None = None, **kwargs) -> None:
         doc_path = Path(doc_dir)
+
+        if doc_path.is_file():
+            self._build_single_file(doc_path, **kwargs)
+        else:
+            self._build_directory(doc_path, file_tags, **kwargs)
+
+    def _build_single_file(self, file_path: Path, **kwargs) -> None:
+        """索引单个文件。"""
+        state = self._load_state()
+
+        if file_path.suffix.lower() not in supported_extensions():
+            logger.warning("Unsupported file extension: %s", file_path.suffix)
+            return
+
+        file_hash = self._file_hash(file_path)
+        rel_path = str(file_path)
+
+        old_state = state.get(rel_path)
+        if isinstance(old_state, dict) and old_state.get("hash") == file_hash:
+            logger.info("File unchanged, skipping: %s", rel_path)
+            return
+
+        loader = get_loader(file_path.suffix.lower())
+        documents = loader.load(str(file_path))
+
+        for doc in documents:
+            doc.metadata["doc_version"] = str(
+                int(old_state.get("version", "0")) + 1
+            ) if isinstance(old_state, dict) and old_state.get("hash") != file_hash else old_state.get("version", "0")
+            doc.metadata["doc_level"] = self.doc_level
+
+        chunks = self.chunker.chunk(documents, **kwargs)
+        logger.info("File %s → %d chunks", rel_path, len(chunks))
+        self._attribute_page_numbers(chunks, documents)
+        self._index_chunks(chunks, rel_path)
+
+        state[rel_path] = {
+            "hash": file_hash,
+            "version": doc.metadata.get("doc_version", "0") if documents else "0",
+            "last_indexed": datetime.now().isoformat(),
+            "chunk_ids": [c.id for c in chunks],
+        }
+        self._save_state(state)
+
+    def _build_directory(self, doc_path: Path, file_tags: dict[str, list[str]] | None = None, **kwargs) -> None:
         state = self._load_state()
 
         tags_yaml_path = doc_path / "tags.yaml"
         yaml_tags = parse_tags_yaml(tags_yaml_path)
 
         current_files: set[str] = set()
-        seen_paths: set[str] = set()
 
         for fp in doc_path.rglob("*"):
             if not fp.is_file() or fp.suffix.lower() not in supported_extensions():
@@ -60,7 +104,6 @@ class Indexer:
             file_hash = self._file_hash(fp)
             rel_path = str(fp)
             current_files.add(rel_path)
-            seen_paths.add(rel_path)
 
             old_state = state.get(rel_path)
             if isinstance(old_state, dict) and old_state.get("hash") == file_hash:
@@ -74,12 +117,12 @@ class Indexer:
             yaml_matched = match_file_tags(norm_path, yaml_tags)
             merged = manual_tags + [t for t in yaml_matched if t not in manual_tags]
 
-            # LLM 自动打标：当无手动标注且开启配置时，用 LLM 生成 topic_tags
+            # LLM 自动打标
             llm_tags = _generate_llm_tags(documents, file_path=str(fp)) if not merged and settings.rag.enable_llm_tagging else None
             if llm_tags:
                 merged = llm_tags
 
-            # 版本追踪：文件变更时递增版本号
+            # 版本追踪
             old_version = old_state.get("version", "0") if isinstance(old_state, dict) else "0"
             new_version = str(int(old_version) + 1) if isinstance(old_state, dict) and old_state.get("hash") != file_hash else old_version
 
@@ -91,35 +134,8 @@ class Indexer:
             chunks = self.chunker.chunk(documents, **kwargs)
             logger.info("File %s → %d chunks", rel_path, len(chunks))
 
-            # 将 char_start 映射为实际页码
             self._attribute_page_numbers(chunks, documents)
-
-            if chunks:
-                # 并发 embedding + 写库：每批独立提交，提高大文件索引速度
-                batch_size = 64
-                total = len(chunks)
-                batches = [chunks[i:i + batch_size] for i in range(0, total, batch_size)]
-
-                def _process_batch(batch_idx: int, batch_chunks: list) -> int:
-                    texts = [c.full_text for c in batch_chunks]
-                    embeddings = self.embedder.embed_texts(texts)
-                    self.store.add(batch_chunks, embeddings)
-                    if self.es_client:
-                        self.es_client.add(batch_chunks)
-                    return batch_idx
-
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    futures = {
-                        executor.submit(_process_batch, i, b): i
-                        for i, b in enumerate(batches)
-                    }
-                    for future in as_completed(futures):
-                        idx = futures[future]
-                        future.result()  # 抛出异常则中断
-                        logger.info(
-                            "Indexed batch [%d/%d] for %s",
-                            idx + 1, len(batches), rel_path,
-                        )
+            self._index_chunks(chunks, rel_path)
 
             state[rel_path] = {
                 "hash": file_hash,
@@ -127,15 +143,14 @@ class Indexer:
                 "last_indexed": datetime.now().isoformat(),
                 "chunk_ids": [c.id for c in chunks],
             }
-            self._save_state(state)  # 每文件保存，防止中途中断丢失状态
+            self._save_state(state)
 
-        # 清理已删除的文件：state 中存在但磁盘上已删除的文件
+        # 清理已删除的文件
         stale_paths = [p for p in state if p not in current_files]
         if stale_paths:
             stale_chunk_ids: list[str] = []
             for p in stale_paths:
                 stale_chunk_ids.extend(state[p].get("chunk_ids", []))
-                # 同时清理 ES 索引
                 if self.es_client:
                     self.es_client.delete_by_file_path(p)
                 del state[p]
@@ -146,6 +161,31 @@ class Indexer:
                     len(stale_chunk_ids), len(stale_paths),
                 )
             self._save_state(state)
+
+    def _index_chunks(self, chunks: list, rel_path: str) -> None:
+        """并发 embedding + 写库。"""
+        if not chunks:
+            return
+        batch_size = 64
+        batches = [chunks[i:i + batch_size] for i in range(0, len(chunks), batch_size)]
+
+        def _process_batch(batch_idx: int, batch_chunks: list) -> int:
+            texts = [c.full_text for c in batch_chunks]
+            embeddings = self.embedder.embed_texts(texts)
+            self.store.add(batch_chunks, embeddings)
+            if self.es_client:
+                self.es_client.add(batch_chunks)
+            return batch_idx
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(_process_batch, i, b): i
+                for i, b in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                future.result()
+                logger.info("Indexed batch [%d/%d] for %s", idx + 1, len(batches), rel_path)
 
     def rebuild(self, doc_dir: str, **kwargs) -> None:
         self.store.delete([])
