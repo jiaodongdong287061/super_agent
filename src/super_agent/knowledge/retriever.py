@@ -177,7 +177,7 @@ class MultiStoreRetriever:
         empty_ids = [r.chunk.id for r in candidates if not r.chunk.content]
         if empty_ids:
             hydrated = self.stores[0].search(query_emb, top_k * 5, merged_filters)
-            hydrated_map = {c.id: c for c in hydrated}
+            hydrated_map = {sr.chunk.id: sr.chunk for sr in hydrated}
             for r in candidates:
                 if not r.chunk.content and r.chunk.id in hydrated_map:
                     r.chunk = hydrated_map[r.chunk.id]

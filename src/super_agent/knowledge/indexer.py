@@ -68,10 +68,11 @@ class Indexer:
         loader = get_loader(file_path.suffix.lower())
         documents = loader.load(str(file_path))
 
+        old_version = old_state.get("version", "0") if isinstance(old_state, dict) else "0"
+        new_version = str(int(old_version) + 1)
+
         for doc in documents:
-            doc.metadata["doc_version"] = str(
-                int(old_state.get("version", "0")) + 1
-            ) if isinstance(old_state, dict) and old_state.get("hash") != file_hash else old_state.get("version", "0")
+            doc.metadata["doc_version"] = new_version
             doc.metadata["doc_level"] = self.doc_level
 
         chunks = self.chunker.chunk(documents, **kwargs)
@@ -81,7 +82,7 @@ class Indexer:
 
         state[rel_path] = {
             "hash": file_hash,
-            "version": doc.metadata.get("doc_version", "0") if documents else "0",
+            "version": new_version,
             "last_indexed": datetime.now().isoformat(),
             "chunk_ids": [c.id for c in chunks],
         }
