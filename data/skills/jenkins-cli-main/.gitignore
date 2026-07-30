@@ -1,0 +1,68 @@
+# Binaries
+/bin/
+/dist/
+/build/
+/tmp_release/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build cache
+*.test
+*.out
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Generated docs
+/site/
+
+# Plugin build outputs
+plugin/target/
+.tmp-jk-e2e/
+
+# Security scanning reports
+gitleaks-report.json
+gitleaks-report.sarif
+results.sarif
+*.sarif
+
+# Coverage reports
+coverage.out
+coverage.html
+*.coverprofile
+
+# Kapsis protective patterns (auto-added)
+# These patterns prevent accidental commits of internal files
+# Do not remove - they protect against agent misconfigurations
+
+# Kapsis internal files
+.kapsis/
+
+# Literal tilde paths (failed tilde expansion creates directory named "~")
+# This is NOT the same as *~ which matches backup files ending in ~
+~
+~/
+
+# AI tool configuration directories (most should stay local)
+# Track skills subdirectories for distribution
+.claude/**
+!.claude/skills/
+!.claude/skills/**
+.codex/
+.agents/**
+!.agents/skills/
+!.agents/skills/**
+.aider/
+.agent-mail/
+.amqrc
+
+# Python virtual environments
+.venv*/
+venv/
+.venv/

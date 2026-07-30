@@ -1,4 +1,20 @@
+from __future__ import annotations
+
 from super_agent.knowledge.stores.base import BaseVectorStore
+
+BASE_COLLECTION_NAME = "super_agent_docs"
+
+
+def _resolve_tenant_id(collection_name: str) -> str:
+    """Extract tenant_id from collection name.
+
+    "super_agent_docs" → ""
+    "super_agent_docs_dept1" → "dept1"
+    """
+    prefix = f"{BASE_COLLECTION_NAME}_"
+    if collection_name.startswith(prefix):
+        return collection_name[len(prefix):]
+    return ""
 
 
 def get_store(provider: str | None = None, tenant_id: str = "") -> BaseVectorStore:
@@ -60,3 +76,59 @@ def get_all_tenant_stores() -> list[BaseVectorStore]:
         tenant_id = col_name[len(base_name) + 1:]
         stores.append(get_store(tenant_id=tenant_id))
     return stores
+
+
+def list_collections() -> list[dict]:
+    """List all vector store collections with name, count, and tenant_id.
+
+    Returns:
+        list[dict]: Each dict has keys:
+            - name: str — collection name
+            - tenant_id: str — "" for public, department id for tenant-specific
+            - count: int — number of documents in the collection
+            - provider: str — vector store provider name
+    """
+    from super_agent.config import settings
+
+    cfg = settings.vector_store
+    collections: list[dict] = []
+
+    if cfg.provider == "chroma":
+        import chromadb
+        client = chromadb.PersistentClient(path=cfg.chroma_persist_dir)
+        for col in client.list_collections():
+            collections.append({
+                "name": col.name,
+                "tenant_id": _resolve_tenant_id(col.name),
+                "count": col.count(),
+                "provider": "chroma",
+            })
+
+    elif cfg.provider == "milvus":
+        from pymilvus import MilvusClient
+        client = MilvusClient(uri=f"http://{cfg.milvus_host}:{cfg.milvus_port}")
+        for name in client.list_collections():
+            stats = client.get_collection_stats(name)
+            collections.append({
+                "name": name,
+                "tenant_id": _resolve_tenant_id(name),
+                "count": int(stats.get("row_count", 0)),
+                "provider": "milvus",
+            })
+
+    elif cfg.provider == "qdrant":
+        from qdrant_client import QdrantClient
+        client_kwargs: dict = {"url": cfg.qdrant_url, "prefer_grpc": False}
+        if cfg.qdrant_api_key:
+            client_kwargs["api_key"] = cfg.qdrant_api_key
+        client = QdrantClient(**client_kwargs)
+        for col in client.get_collections().collections:
+            info = client.get_collection(col.name)
+            collections.append({
+                "name": col.name,
+                "tenant_id": _resolve_tenant_id(col.name),
+                "count": info.points_count or 0,
+                "provider": "qdrant",
+            })
+
+    return collections

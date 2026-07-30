@@ -1,0 +1,363 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)release (e.g., v1.0.0)'
+        required: true
+        type: string
+      skip-skill-publish:
+        description: 'Skip skill publishing (useful for GoReleaser/Homebrew-only reruns)'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Keep workflow_dispatch reruns serialized per tag while letting distinct release commits run independently.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: "${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'chore(release): v') }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+      version: ${{ steps.prepare.outputs.version }}
+      release_ref: ${{ steps.prepare.outputs.release_ref }}
+      release_sha: ${{ steps.prepare.outputs.release_sha }}
+      prerelease: ${{ steps.prepare.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+      - name: Resolve release metadata
+        id: prepare
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          validate_tag() {
+            local tag="$1"
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+              echo "::error::Release identifiers must use vX.Y.Z style tags."
+              exit 1
+            fi
+          }
+
+          tag_commit_sha() {
+            git rev-parse "refs/tags/${1}^{commit}" 2>/dev/null || git rev-parse "refs/tags/${1}"
+          }
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              tag="$INPUT_TAG"
+              validate_tag "$tag"
+              git fetch --force --tags origin
+              if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+                echo "::error::Tag ${tag} does not exist. workflow_dispatch is only for rerunning an existing release."
+                exit 1
+              fi
+              git checkout --detach "$tag"
+              version="${tag#v}"
+              ./scripts/check-release-version.sh "$version"
+              release_ref="$tag"
+              release_sha="$(tag_commit_sha "$tag")"
+              ;;
+            push)
+              commit_subject="${COMMIT_MESSAGE%%$'\n'*}"
+              tag="${commit_subject#chore(release): }"
+              tag="${tag%% \(#*}"
+              validate_tag "$tag"
+
+              version="${tag#v}"
+              ./scripts/check-release-version.sh "$version"
+
+              release_sha="${GITHUB_SHA}"
+              if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+                existing_sha="$(tag_commit_sha "$tag")"
+                if [[ "$existing_sha" != "$release_sha" ]]; then
+                  echo "::error::Tag ${tag} already exists but points to ${existing_sha}, not ${release_sha}."
+                  exit 1
+                fi
+              fi
+              release_ref="${release_sha}"
+              ;;
+            *)
+              echo "::error::Unsupported event: ${EVENT_NAME}"
+              exit 1
+              ;;
+          esac
+
+          prerelease=false
+          if [[ "$tag" == *-* ]]; then
+            prerelease=true
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "release_ref=${release_ref}"
+            echo "release_sha=${release_sha}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_ref }}
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Verify Docker
+        run: docker version
+
+      - name: Verify release metadata
+        run: ./scripts/check-release-version.sh "${{ needs.prepare.outputs.version }}"
+      - name: Check skill sync
+        run: make check-skills
+      - name: Check generated skill rules
+        run: make check-generated-skill
+      - name: Verify gofmt
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          if [[ -n "$files" ]]; then
+            echo "The following files need gofmt:" >&2
+            echo "$files" >&2
+            exit 1
+          fi
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: JK_E2E_DISABLE=1 make test
+
+      - name: Run end-to-end tests
+        run: make e2e
+
+      - name: Build CLI
+        run: VERSION=${{ needs.prepare.outputs.tag }} make build
+
+      - name: Check embedded version
+        run: ./bin/jk version | head -n1 | grep -Fx "jk version ${{ needs.prepare.outputs.tag }}"
+
+  release:
+    runs-on: macos-latest
+    needs: [prepare, verify]
+    if: needs.prepare.result == 'success' && needs.verify.result == 'success'
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: "1.25.x"
+
+      - name: Install Syft
+        run: brew install syft
+
+      - name: Create release tag after verification
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+
+          tag_commit_sha() {
+            git rev-parse "refs/tags/${1}^{commit}" 2>/dev/null || git rev-parse "refs/tags/${1}"
+          }
+
+          git fetch --force --tags origin
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            existing_sha="$(tag_commit_sha "$TAG")"
+            if [[ "$existing_sha" != "$RELEASE_SHA" ]]; then
+              echo "::error::Tag ${TAG} already exists but points to ${existing_sha}, not ${RELEASE_SHA}."
+              exit 1
+            fi
+          else
+            git tag "$TAG" "$RELEASE_SHA"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+      - name: Extract release notes for this tag
+        shell: bash
+        env:
+          RELEASE_NOTES_PATH: ${{ runner.temp }}/RELEASE_NOTES.md
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          python3 - "$VERSION" "$RELEASE_NOTES_PATH" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          output_path = pathlib.Path(sys.argv[2])
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = re.compile(
+              rf"(?ms)^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}\n.*?(?=^## \[|\Z)"
+          )
+          match = pattern.search(text)
+          if not match:
+              raise SystemExit(f"missing changelog section for {version}")
+          output_path.write_text(match.group(0).strip() + "\n", encoding="utf-8")
+          PY
+
+      - name: GoReleaser
+        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean --release-notes ${{ runner.temp }}/RELEASE_NOTES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Collect attestation subjects
+        id: attestation_subjects
+        shell: bash
+        run: |
+          set -euo pipefail
+          subjects="$(find dist -maxdepth 1 -type f | sort)"
+          if [[ -z "$subjects" ]]; then
+            echo "::error::No release artifacts found to attest."
+            exit 1
+          fi
+          {
+            echo "subjects<<EOF"
+            printf '%s\n' "$subjects"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate artifact attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-path: ${{ steps.attestation_subjects.outputs.subjects }}
+
+  skill-publish:
+    name: Publish Skills
+    needs: [prepare, release]
+    if: >-
+      needs.release.result == 'success' &&
+      (github.event_name == 'push' || inputs.skip-skill-publish != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '20'
+
+      - name: Install skild
+        run: npm install -g skild
+
+      - name: Configure skild auth
+        run: |
+          mkdir -p ~/.skild
+          echo '${{ secrets.SKILD_AUTH_JSON }}' > ~/.skild/registry-auth.json
+
+      - name: Verify release metadata
+        run: ./scripts/check-release-version.sh "${{ needs.prepare.outputs.version }}"
+
+      - name: Publish skills
+        env:
+          TAG_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          echo "$TAG_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$' || {
+            echo "ERROR: version '$TAG_VERSION' is not semver"
+            exit 1
+          }
+
+          FAILED=0
+
+          for dir in skills/*/; do
+            [ -f "$dir/SKILL.md" ] || continue
+            SKILL=$(basename "$dir")
+            VERSION="${TAG_VERSION}"
+
+            echo "Publishing $SKILL version $VERSION"
+
+            ALIAS_ARGS=()
+            if [ ${#SKILL} -ge 3 ] && [ ${#SKILL} -le 64 ]; then
+              ALIAS_ARGS=(--alias "$SKILL")
+            else
+              echo "⚠ Skipping alias for $SKILL: length ${#SKILL} outside 3..64"
+            fi
+
+            if OUTPUT=$(npx skild publish \
+              --dir "$dir" \
+              "${ALIAS_ARGS[@]}" \
+              --skill-version "$VERSION" 2>&1); then
+              echo "$OUTPUT"
+              echo "✓ Published $SKILL version $VERSION"
+            elif echo "$OUTPUT" | grep -q "Version already exists"; then
+              echo "$OUTPUT"
+              echo "⚠ $SKILL version $VERSION already published — skipping"
+            elif echo "$OUTPUT" | grep -q "Alias already in use"; then
+              echo "$OUTPUT"
+              echo "⚠ Alias '$SKILL' taken — retrying without alias..."
+              if OUTPUT2=$(npx skild publish \
+                --dir "$dir" \
+                --skill-version "$VERSION" 2>&1); then
+                echo "$OUTPUT2"
+                echo "✓ Published $SKILL version $VERSION (without alias)"
+              elif echo "$OUTPUT2" | grep -q "Version already exists"; then
+                echo "$OUTPUT2"
+                echo "⚠ $SKILL version $VERSION already published on retry — skipping"
+              else
+                echo "✖ Publish failed for $SKILL (even without alias)"
+                echo "$OUTPUT2"
+                FAILED=1
+              fi
+            else
+              echo "✖ Publish failed for $SKILL"
+              echo "$OUTPUT"
+              FAILED=1
+            fi
+          done
+
+          exit $FAILED

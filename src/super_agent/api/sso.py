@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import warnings
 from collections.abc import Callable
 from urllib.parse import urlencode
 
@@ -24,6 +25,9 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from super_agent.config import settings
+
+# 密钥长度由 SSO 服务端决定，抑制 PyJWT 的警告
+warnings.filterwarnings("ignore", category=pyjwt.InsecureKeyLengthWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +57,7 @@ def _get_sso_redis():
                 if "@" in rest:
                     rest = rest.split("@", 1)[1]
                 url = f"{scheme}://:{cfg.redis_password}@{rest}"
-        _sso_redis = redis.from_url(url, decode_responses=True)
+        _sso_redis = redis.from_url(url, decode_responses=True, protocol=2)
     return _sso_redis
 
 

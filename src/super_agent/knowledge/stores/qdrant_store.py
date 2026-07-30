@@ -70,6 +70,7 @@ class QdrantStore(BaseVectorStore):
             query=query_embedding,
             limit=top_k,
             query_filter=qdrant_filter,
+            score_threshold=settings.vector_store.qdrant_score_threshold or None,
             with_payload=True,
         ).points
 

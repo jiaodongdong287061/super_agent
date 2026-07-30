@@ -1,4 +1,9 @@
-"""Elasticsearch BM25 全文检索客户端（双存储架构中的 BM25 层）。"""
+"""Elasticsearch BM25 全文检索客户端（双存储架构中的 BM25 层）。
+
+每个部门/租户使用独立索引，索引命名规则：
+  super_agent_docs            — 公共索引
+  super_agent_docs_{tenant}   — 部门/租户索引
+"""
 
 from __future__ import annotations
 
@@ -41,11 +46,17 @@ _BM25_INDEX_MAPPING = {
 
 
 class ESClient:
-    """Elasticsearch 客户端，封装 BM25 全文检索的索引和搜索操作。"""
+    """Elasticsearch 客户端，封装 BM25 全文检索的索引和搜索操作。
 
-    def __init__(self) -> None:
+    每个实例绑定一个索引（公共或部门级），通过 tenant_id 区分。
+    """
+
+    def __init__(self, tenant_id: str = "") -> None:
         self._client: "elasticsearch.Elasticsearch | None" = None  # type: ignore[name-defined]
         self._index_ready = False
+        self.index_name = settings.es.index_name
+        if tenant_id:
+            self.index_name = f"{self.index_name}_{tenant_id}"
 
     # ── 生命周期 ──────────────────────────────────────────
 
@@ -54,10 +65,9 @@ class ESClient:
         if self._index_ready:
             return
         client = self._get_client()
-        index = settings.es.index_name
-        if not client.indices.exists(index=index):
-            client.indices.create(index=index, body=_BM25_INDEX_MAPPING)
-            logger.info("ES index '%s' created with ik_smart analyzer", index)
+        if not client.indices.exists(index=self.index_name):
+            client.indices.create(index=self.index_name, body=_BM25_INDEX_MAPPING)
+            logger.info("ES index '%s' created with ik_smart analyzer", self.index_name)
         self._index_ready = True
 
     def close(self) -> None:
@@ -73,7 +83,6 @@ class ESClient:
             return
         self.ensure_index()
         client = self._get_client()
-        index = settings.es.index_name
 
         batch: list[dict] = []
         for c in chunks:
@@ -94,7 +103,7 @@ class ESClient:
 
         actions = []
         for doc in batch:
-            actions.append({"index": {"_index": index, "_id": doc["chunk_id"]}})
+            actions.append({"index": {"_index": self.index_name, "_id": doc["chunk_id"]}})
             actions.append(doc)
             if len(actions) >= settings.es.chunk_batch_size * 2:
                 client.bulk(operations=actions, refresh=False)
@@ -102,36 +111,39 @@ class ESClient:
         if actions:
             client.bulk(operations=actions, refresh=False)
 
-        logger.info("ES indexed %d chunks -> %s", len(batch), index)
+        logger.info("ES indexed %d chunks -> %s", len(batch), self.index_name)
 
     # ── 检索 ──────────────────────────────────────────────
 
-    def search(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
-        """BM25 全文检索，返回 (chunk_id, bm25_score) 列表。"""
+    def search(self, query: str, top_k: int = 5) -> list[tuple[str, float, dict]]:
+        """BM25 全文检索，返回 (chunk_id, bm25_score, source_data) 列表。"""
         if not query.strip():
             return []
         self.ensure_index()
         client = self._get_client()
 
-        resp = client.search(
-            index=settings.es.index_name,
-            body={
-                "query": {
-                    "multi_match": {
-                        "query": query,
-                        "fields": ["content^2", "heading_chain"],
-                        "type": "best_fields",
-                    }
-                },
-                "size": top_k,
+        body: dict = {
+            "query": {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["content^2", "heading_chain"],
+                    "type": "best_fields",
+                    "minimum_should_match": settings.es.bm25_minimum_should_match,
+                }
             },
-        )
+            "size": top_k,
+        }
+        if settings.es.bm25_score_threshold > 0:
+            body["min_score"] = settings.es.bm25_score_threshold
 
-        results: list[tuple[str, float]] = []
+        resp = client.search(index=self.index_name, body=body)
+
+        results: list[tuple[str, float, dict]] = []
         for hit in resp["hits"]["hits"]:
             chunk_id = hit["_id"]
             score = float(hit["_score"])
-            results.append((chunk_id, score))
+            source = hit.get("_source", {})
+            results.append((chunk_id, score, source))
         return results
 
     # ── 删除 ──────────────────────────────────────────────
@@ -141,9 +153,8 @@ class ESClient:
             return
         self.ensure_index()
         client = self._get_client()
-        index = settings.es.index_name
 
-        actions = [{"delete": {"_index": index, "_id": cid}} for cid in chunk_ids]
+        actions = [{"delete": {"_index": self.index_name, "_id": cid}} for cid in chunk_ids]
         client.bulk(operations=actions, refresh=False)
 
     def delete_by_file_path(self, file_path: str) -> None:
@@ -151,7 +162,7 @@ class ESClient:
         self.ensure_index()
         client = self._get_client()
         client.delete_by_query(
-            index=settings.es.index_name,
+            index=self.index_name,
             body={"query": {"term": {"file_path": file_path}}},
             refresh=False,
         )
@@ -160,7 +171,7 @@ class ESClient:
         self.ensure_index()
         client = self._get_client()
         client.delete_by_query(
-            index=settings.es.index_name,
+            index=self.index_name,
             body={"query": {"match_all": {}}},
             refresh=False,
         )
@@ -168,7 +179,7 @@ class ESClient:
     def count(self) -> int:
         self.ensure_index()
         client = self._get_client()
-        resp = client.count(index=settings.es.index_name)
+        resp = client.count(index=self.index_name)
         return int(resp["count"])
 
     # ── 内部 ──────────────────────────────────────────────

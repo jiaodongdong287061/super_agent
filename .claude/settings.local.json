@@ -67,7 +67,20 @@
       "Bash(ls \".venv/Lib/site-packages/_cffi_backend.cp312-win_amd64.pyd\")",
       "Bash(cmd.exe *)",
       "Bash(uv venv *)",
-      "Bash(taskkill //IM uvicorn.exe //F)"
+      "Bash(taskkill //IM uvicorn.exe //F)",
+      "WebFetch(domain:www.claudeskills.org)",
+      "WebFetch(domain:futureagi.com)",
+      "Bash(findstr :8000)",
+      "Bash(taskkill *)",
+      "Bash(pkill -f \"uvicorn super_agent.main\")",
+      "Bash(powershell -Command \"Get-Process -Id 8828,26968,29992 -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(findstr \":8000.*LISTENING\")",
+      "Bash(taskkill.exe /F /PID 8828)",
+      "Bash(taskkill.exe /F /PID 26968)",
+      "Bash(taskkill.exe /F /PID 29992)",
+      "Bash(taskkill.exe //F //PID 8828)",
+      "Bash(taskkill.exe //F //PID 26968)",
+      "Bash(taskkill.exe //F //PID 29992)"
     ]
   }
 }

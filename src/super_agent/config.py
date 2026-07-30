@@ -84,6 +84,7 @@ class VectorStoreConfig(BaseSettings):
     qdrant_api_key: str = ""
     qdrant_vector_size: int = 1024
     qdrant_distance: Literal["COSINE", "EUCLID", "DOT"] = "COSINE"
+    qdrant_score_threshold: float = 0.45
     default_top_k: int = 5
 
     model_config = SettingsConfigDict(env_prefix="SA_VECTOR_")
@@ -115,13 +116,53 @@ class MySQLConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SA_MYSQL_")
 
 
+class GuardrailsConfig(BaseSettings):
+    """安全护栏配置。"""
+    enabled: bool = True
+    inject_detection: bool = True
+    domain_limiter: bool = True
+    sensitivity_filter: bool = True
+    fail_mode: Literal["block", "warn_only"] = "block"
+
+    model_config = SettingsConfigDict(env_prefix="SA_GUARDRAILS_", extra="ignore")
+
+
+class RuntimeConfig(BaseSettings):
+    """Agent Runtime 执行引擎配置。"""
+    max_steps: int = 15           # ReAct 最大循环次数
+    max_tools: int = 10           # 单次加载最大工具数
+    llm_model: str = ""           # 执行用模型（默认 SA_LLM_DEFAULT_MODEL）
+    enable_plan: bool = True      # 是否启用 PlanExecute
+    enable_hitl: bool = True      # 是否启用人工审批
+
+    model_config = SettingsConfigDict(env_prefix="SA_RUNTIME_", extra="ignore")
+
+
+class HITLConfig(BaseSettings):
+    """人工审批网关配置。"""
+    enabled: bool = True
+    default_timeout: int = 300    # 审批超时（秒）
+    risk_threshold: Literal["low", "medium", "high"] = "high"  # 触发审批的最低风险等级
+
+    model_config = SettingsConfigDict(env_prefix="SA_HITL_", extra="ignore")
+
+
+class StateConfig(BaseSettings):
+    """Agent State 持久化配置。"""
+    redis_ttl: int = 1800            # Redis 快照 TTL（秒）
+    max_tool_records: int = 10       # Redis 中保留的最近 tool_call 记录数
+    trace_enabled: bool = True       # 是否写入 trace_events 表
+
+    model_config = SettingsConfigDict(env_prefix="SA_STATE_", extra="ignore")
+
 class SandboxConfig(BaseSettings):
+    """Docker 沙箱配置。"""
     docker_host: str = "unix:///var/run/docker.sock"
     default_profile: str = "code-exec"
     cleanup_on_exit: bool = True
     max_concurrent_containers: int = 5
 
-    model_config = SettingsConfigDict(env_prefix="SA_SANDBOX_")
+    model_config = SettingsConfigDict(env_prefix="SA_SANDBOX_", extra="ignore")
 
 
 class TracingConfig(BaseSettings):
@@ -170,6 +211,8 @@ class ESConfig(BaseSettings):
     index_name: str = "super_agent_docs"
     chunk_batch_size: int = 100
     ca_certs: str = ""
+    bm25_score_threshold: float = 0.0
+    bm25_minimum_should_match: str = "50%"
 
     model_config = SettingsConfigDict(env_prefix="SA_ES_")
 
@@ -199,7 +242,7 @@ class SSOConfig(BaseSettings):
     redirect_uri: str = "http://localhost:8000/auth/callback"
     auth_base_url: str = "http://localhost:8081"
     frontend_url: str = "http://localhost:8000"
-    whitelist: list[str] = ["/health", "/metrics", "/docs", "/openapi.json", "/auth/login", "/auth/callback"]
+    whitelist: list[str] = ["/health", "/metrics", "/docs", "/openapi.json", "/auth/login", "/auth/callback", "/rag/clear"]
     jwt_secret: str = ""  # 必须通过 SA_SSO_JWT_SECRET 配置，需和 Java SSO 端一致
     session_max_age: int = 43200  # 12小时
     redis_enabled: bool = True
@@ -224,6 +267,10 @@ class Settings(BaseSettings):
     ocr: OCRConfig = OCRConfig()
     rag: RAGConfig = RAGConfig()
     es: ESConfig = ESConfig()
+    guardrails: GuardrailsConfig = GuardrailsConfig()
+    runtime: RuntimeConfig = RuntimeConfig()
+    hitl: HITLConfig = HITLConfig()
+    state_config: StateConfig = StateConfig()
     env: Literal["dev", "prod"] = "dev"
 
     model_config = SettingsConfigDict(env_prefix="SA_")
@@ -244,6 +291,10 @@ class Settings(BaseSettings):
         self.ocr = OCRConfig()
         self.rag = RAGConfig()
         self.es = ESConfig()
+        self.guardrails = GuardrailsConfig()
+        self.runtime = RuntimeConfig()
+        self.hitl = HITLConfig()
+        self.state_config = StateConfig()
         return self
 
 

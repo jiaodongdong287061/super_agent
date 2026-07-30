@@ -25,7 +25,12 @@
                   |
                   |
           Single Agent Runtime  <── 执行引擎：唯一的 Agent 入口
-                  |
+                  |                   │
+                  │           Agent State
+                  │           ├─ 驱动 ReAct/PlanExecute 循环
+                  │           ├─ 持久化 Redis（快照 TTL 30min）
+                  │           ├─ 归档 MySQL（agent_sessions）
+                  │           └─ Part C 直接复用，无重复埋点
                   |
       ┌───────────┼───────────┐
       |           |           |
@@ -42,6 +47,11 @@
                   |
                   |
              Execution  <─────── 实际执行层
+                  |               │
+                  |      Docker 沙箱
+                  |      ├─ 四种 profile（code/ops/skill/pipeline）
+                  |      ├─ Skill scripts/ 强制隔离执行
+                  |      └─ 资源限制 + 超时销毁
 ```
 
 ### 1.2 核心思想
@@ -72,9 +82,10 @@ Step 2: Classifier
         → 意图: tool_call（需要调工具）
         → 风险: high（涉及重启，写操作）
         → 复杂度: multi_step（查状态 → 判断 → 重启）
-        ↓ 输出 {type: "tool", risk: "high", plan_needed: true}
+        ↓ 输出 {type: "action", risk: "high", complexity: "multi_step"}
 
 Step 3: Single Agent Runtime（主循环）
+        → 加载 Skills（L1 元数据已就绪，L2 匹配 mysql-troubleshooting）
         → 加载 Tools: [mysql_query, server_restart]
         → 加载 RAG: DBA 知识库
         → LLM: "先查 slave 状态" → 调 mysql_query
@@ -82,14 +93,14 @@ Step 3: Single Agent Runtime（主循环）
         → 触发 PlanExecute（复杂任务）
         ↓
 
-Step 4: PlanExecute
-        → Planner: 拆步骤
+Step 4: PlanExecute（携 Skills 指导执行）
+        → Planner: 拆步骤（参考 mysql-troubleshooting 的 SKILL.md 流程）
           Step1: 执行 show slave status
           Step2: 分析延迟原因
           Step3: 执行 restart slave
         → Executor: 逐步执行
           Step1 → mysql_query → OK
-          Step2 → LLM 分析 → 确定需要重启
+          Step2 → LLM 分析+SKILL.md 指导 → 确定需要重启
           Step3 → server_restart → 触发 HITL
         ↓
 
@@ -249,12 +260,11 @@ Classifier 负责**理解用户请求**，决定接下来的执行路径。它�
 |------|------|------|
 | `qa` | 闲聊/问候/通用问答，**仅当用户有 `system:allow_chat` 权限时才可用** | "你好"、"今天天气" |
 | `knowledge` | 需要查企业知识库（HR/财务/IT/通用知识），**无结果时 LLM 用自己的知识兜底** | "什么是主从复制"、"公司年假政策" |
-| `tool` | 需要调工具，工具返回的数据是真实来源 | "查一下 Jenkins 构建 #123 的日志" |
-| `complex` | 多步骤、需要编排 | "排查 MySQL 延迟并修复" |
+| `action` | 需要调工具/执行操作，工具返回的数据是真实来源。**是否走 PlanExecute 由 complexity 决定** | "查一下 Jenkins 构建 #123 的日志"、"排查 MySQL 延迟并修复" |
 
 > **注意**：
 > - `qa` 由 Guardrails 的 `system:allow_chat` 权限控制是否可达。无权用户的 qa query 在 Guardrails 阶段就被拦截，不会流到 Classifier。
-> - `knowledge` 是默认兜底意图。只要不是 `qa`（问候/闲聊）或 `tool`（明确的操作指令），都归为 `knowledge`。
+> - `knowledge` 是默认兜底意图。只要不是 `qa`（问候/闲聊）或 `action`（明确的操作指令），都归为 `knowledge`。
 > - RAG 覆盖全企业知识，不限于 IT 运维。
 
 **维度 2：风险（risk）**
@@ -275,40 +285,101 @@ Classifier 负责**理解用户请求**，决定接下来的执行路径。它�
 ### 3.3 输出
 
 ```python
+@dataclass
 class ClassificationResult:
-    intent: Literal["qa", "knowledge", "tool", "complex"]
+    intent: Literal["qa", "knowledge", "action"]
     risk: Literal["low", "medium", "high"]
     complexity: Literal["simple", "multi_step"]
-    plan_needed: bool          # 是否需要 PlanExecute
+    confidence: float      # 置信度：rule≥0.8 / embedding≥0.65 / llm=0.7
+    source: Literal["rule", "embedding", "llm", "cache"]
 ```
 
-### 3.4 分类策略
+### 3.4 分类策略（三层架构）
 
-**第一层：规则匹配（毫秒级）**
+```
+                    HybridClassifier
+                           │
+             第一层：RuleClassifier（规则匹配，毫秒级）
+             ┌─────────────┴─────────────┐
+             │ 关键词命中                │ 未命中
+             │ confidence ≥ 0.8          │ confidence = 0.5
+             │ 直接返回                  │ 进入下一层
+             └───────────────────────────┘
+                           │
+             第二层：EmbeddingClassifier（向量语义，毫秒级）
+             ┌─────────────┴─────────────┐
+             │ 语义匹配（余弦相似度）    │ 相似度不足
+             │ confidence ≥ 0.65         │ confidence < 0.65
+             │ 直接返回                  │ 进入下一层
+             └───────────────────────────┘
+                           │
+             第三层：LLM 兜底（秒级）
+                           │
+                       返回结果
+```
+
+**第一层：规则匹配（RuleClassifier）**
 
 ```
 qa 关键词（极窄，仅问候/闲聊/元问题）:
   "你好"、"嗨"、"你是谁"、"你能做什么"、"谢谢"、"再见"
-  → intent=qa, 直接跳过 RAG 和工具
+  "今天"、"明天"、"星期"、"日期"、"时间"、"节日"
+  → intent=qa, complexity=simple, 直接跳过 RAG 和工具
 
 knowledge 关键词（宽泛，默认兜底）:
   "怎么看"、"怎么查"、"如何"、"步骤"、"方法"、"区别"、"什么是"
   "为什么"、"原因"、"原理"、"对比"、"有哪些"
-  → intent=knowledge, 先查知识库，无结果 LLM 兜底
-  * 注：只要不命中 qa 或 tool 关键词，都走 knowledge
+  → intent=knowledge, complexity=simple, 先查知识库，无结果 LLM 兜底
 
-tool 关键词（明确的操作指令）:
-  "重启"、"删除"、"创建"、"修改"、"执行"、"运行"、"查一下+[系统]"
-  → intent=tool, 加载对应工具
-
-complex（多步骤/排查类）:
-  "排查"、"处理"、"修复"、"分析" → 且 query 包含 2+ 个操作对象
-  → intent=complex, 启用 PlanExecute
+action 关键词（明确的操作指令）:
+  单步操作:
+    "重启"、"删除"、"创建"、"修改"、"执行"、"运行"、"查一下+[系统]"
+    → intent=action, complexity=simple, 加载对应工具走 ReAct
+  多步排查:
+    "排查"、"处理"、"修复"、"分析" → 且 query 包含 2+ 个操作对象
+    → intent=action, complexity=multi_step, 加载工具 + PlanExecute
 ```
 
-**第二层：LLM 兜底（规则无法判定时，秒级）**
+**第二层：Embedding 语义匹配（EmbeddingClassifier）**
 
-规则无法判定的 query，交给 LLM 分类。给 LLM 的判定 prompt 要明确：
+关键词匹配不上时，用向量相似度做语义级意图分类。
+
+```
+原理：
+  1. 每个 intent 在 YAML 配置若干示例问句
+  2. 服务启动时预计算示例的 embedding 向量
+  3. 用户 query 到来时也转成 embedding
+  4. 与各 intents 的示例计算余弦相似度（取同类最大值）
+  5. 最高相似度 ≥ 0.65 → 匹配该意图
+
+YAML 配置示例：
+  qa_examples:
+    - "你好"
+    - "今天天气怎么样"
+    - "今天是什么节日"
+    - "几点了"
+
+  knowledge_examples:
+    - "什么是主从复制"
+    - "mysql 怎么部署"
+    - "磁盘IO瓶颈如何排查"
+    - "k8s pod 起不来怎么排查"
+
+  action_examples:
+    - "重启服务器 10.0.1.5"
+    - "查一下 Jenkins 构建 #123 的日志"
+    - "创建工单，描述磁盘空间不足"
+
+覆盖场景：
+  - RuleClassifier 匹配不上但跟示例语义接近的 query
+    如："slurm 作业排队怎么排查" → 找不到关键词但跟 knowledge 示例语义相似
+  - 同义表达自动覆盖
+    如："怎么部署"和"部署步骤"是相同语义 → embedding 自然匹配
+```
+
+**第三层：LLM 兜底**
+
+规则和 embedding 都拿不准时，交给 LLM 做精细判断。给 LLM 的判定 prompt 要明确：
 
 ```
 用户 query: {query}
@@ -320,32 +391,72 @@ qa: 问候、闲聊、Agent 自身能力咨询。不检索知识库，不调工�
 knowledge: 一切涉及企业知识的问题。先检索知识库，无结果则 LLM 用自己的知识回答。
     示例："什么是主从复制"、"公司年假政策"、"预算怎么审批"
 
-tool: 明确的操作指令，需要调外部系统工具。
-    示例："重启服务器"、"查工单状态"、"发通知"
-
-complex: 需要多步排查或编排的复杂任务。
-    示例："排查数据库慢并修复"
+action: 明确的操作指令，需要调外部系统工具。同时判断复杂度：
+  - simple: 单步操作，直接调工具即可
+  - multi_step: 需要多步编排（排查、修复、分析等）
+    示例 simple: "重启服务器"、"查工单状态"、"发通知"
+    示例 multi_step: "排查数据库慢并修复"
 
 输出格式: {"intent": "knowledge", "risk": "low", "complexity": "simple"}
 ```
 
-**第三层：缓存**
+**第四层：缓存**
 
-相同 query 5 分钟内不重复调用 LLM 分类，直接命中缓存结果。
+相同 query 5 分钟内不重复调用 LLM 分类或 embedding，直接命中缓存结果。
 
-### 3.5 为什么需要 Classifier
+### 3.5 三层互补关系
 
 ```
-没有 Classifier 的话，Agent 遇到"你好"也会：
-1. 加载全部工具列表 → 浪费 token
-2. LLM 在几十个工具里选 → 容易选错
-3. 多走 N 轮无用调用 → 慢
+第一层（RuleClassifier）：
+  "你好" → qa（关键词命中，0.95，直接返回）
+  "重启服务器" → action（关键词命中，0.9，直接返回）
+  负责：有明确标志词的，不需要动脑的场景
 
-有 Classifier 的话：
-"你好" → qa → 直接 LLM 回答，0.3 秒返回，不查库不调工具
-"什么是主从复制" → knowledge → 查知识库，有结果用企业文档，无结果 LLM 兜底
-"重启 MySQL" → tool + high → 加载 tools + 触发 HITL
-"排查数据库慢并修复" → complex → 加载 tools + RAG + PlanExecute
+第二层（EmbeddingClassifier）：
+  "今天是什么节日" → qa（语义匹配，"今天天气怎么样"示例，0.87）
+  "slurm 作业排队怎么排查" → knowledge（语义匹配，0.72）
+  负责：关键词覆盖不到但语义相近的，毫秒级
+
+第三层（LLM）：
+  "查一下昨天的工单状态，把结果发到群里"
+  → embedding 模棱两可（knowledge 0.62, action 0.58）
+  → LLM 判断：action（同时涉及查询和操作）
+  负责：复杂、模棱两可的长尾问题
+
+没有 Classifier 的话：
+  遇到"你好"也会：
+  1. 加载全部工具列表 → 浪费 token
+  2. LLM 在几十个工具里选 → 容易选错
+  3. 多走 N 轮无用调用 → 慢
+```
+
+### 3.6 YAML 配置结构
+
+```yaml
+# classifier.yaml — 三层分类器共用同一份数据
+
+# RuleClassifier 层：短关键词，子串匹配
+qa_keywords:
+  - "你好" / "今天" / "节日" / ...
+
+knowledge_keywords:
+  - "什么是" / "怎么用" / "如何" / ...
+
+action_simple_keywords:
+  - "查一下" / "重启" / "创建" / ...
+
+action_multi_keywords:
+  - "排查" / "修复" / "分析" / ...
+
+# EmbeddingClassifier 层：完整问句，语义匹配
+qa_examples:
+  - "你好" / "今天天气怎么样" / ...
+
+knowledge_examples:
+  - "什么是主从复制" / "mysql 怎么部署" / ...
+
+action_examples:
+  - "重启服务器 10.0.1.5" / "查一下工单状态" / ...
 ```
 
 ---
@@ -402,7 +513,7 @@ Agent Runtime 的核心就是三步循环：
 运行时加载：
   - tools: list[Tool]                  # 根据 query 动态匹配的工具
   - rag_selections: list[RAGSource]    # 根据部门/标签选择的知识库
-  - skills: list[Skill]                # 注册的外部技能
+  - skills: list[SkillMeta]            # L1 元数据已注册，L2 按需加载完整 SKILL.md
 
 输出：
   - answer: str                        # 最终回答
@@ -414,10 +525,10 @@ Agent Runtime 的核心就是三步循环：
 根据 Classifier 的意图，**精确加载**，不全量：
 
 ```
-"重启 MySQL 从库"         → intent=tool
+"重启 MySQL 从库"         → intent=action, complexity=simple
          ↓
 Runtime 动态加载:
-  Tools:  [mysql_query, server_restart]     ← 只加载这俩
+  Tools:  [mysql_query, server_restart]     ← 只加载这俩，走 ReAct
   RAG:    []                                ← tool 不查知识库
 
 "什么是主从复制"           → intent=knowledge
@@ -426,12 +537,12 @@ Runtime 动态加载:
   Tools:  []                                ← knowledge 不加载工具
   RAG:    [DBA 知识库]                       ← 只查知识库
 
-"排查 MySQL 延迟并修复"    → intent=complex
+"排查 MySQL 延迟并修复"    → intent=action, complexity=multi_step
          ↓
 Runtime 动态加载:
   Tools:  [mysql_query, server_restart]
   RAG:    [DBA 知识库]
-  Skills: [mysql_troubleshooting]
+  Skills: [mysql_troubleshooting]            ← 加载 Skills，走 PlanExecute
 ```
 
 **关键规则**：只加载当前任务需要的能力，不是全量加载。全量加载会导致：
@@ -449,17 +560,18 @@ Runtime 动态加载:
                      |
 Classifier 输出 ─────┼── knowledge ─→ RAG 检索 → 注入 context → LLM 回答
                      |                              (无结果 → LLM 兜底)
-                     ├── tool ───────→ 加载工具 → ReAct 循环 → 回答
                      |
-                     └── complex ────→ 加载 RAG + 工具 → PlanExecute → 回答
+                     └── action ───────┼── complexity=simple  → 加载工具 → ReAct 循环 → 回答
+                                     |
+                                     └── complexity=multi_step → 加载 Skills(L2) + RAG + 工具 → PlanExecute → 回答
 ```
 
 | 路径 | 触发条件 | 执行流程 |
 |------|---------|---------|
 | 直接回答 | intent=qa | query → LLM → answer |
-| 知识回答 | intent=knowledge, complexity=simple | query → 查知识库 → 有结果则注入 context → LLM answer，无结果 LLM 兜底 |
-| 工具执行 | intent=tool, complexity=simple | query → 加载工具 → ReAct 循环 → answer |
-| 复杂执行 | intent=complex, complexity=multi_step | query → 加载 RAG + 工具 → PlanExecute → answer |
+| 知识回答 | intent=knowledge | query → 查知识库 → 有结果则注入 context → LLM answer，无结果 LLM 兜底 |
+| 工具执行（单步） | intent=action, complexity=simple | query → 加载工具 → ReAct 循环 → answer |
+| 工具执行（多步） | intent=action, complexity=multi_step | query → 匹配 Skills(L2) + 加载 RAG + 工具 → PlanExecute → answer |
 
 > **注意**：`knowledge` 路径不走 ReAct 循环——它只是"检索 → 回答"，不需要 LLM 反复思考工具调用。这比 ReAct 快得多，也省 token。
 
@@ -482,17 +594,18 @@ class AgentRuntime:
             rag_context = await self._load_rag(query, user)
             return await self._run_knowledge(query, rag_context)
 
-        if classification.intent == "tool":
+        if classification.intent == "action":
             tools = self._load_tools(query)
-            return await self._run_react(query, tools, session_id)
-
-        # complex: 多步骤，加载全部能力
-        tools = self._load_tools(query)
-        rag_context = await self._load_rag(query, user)
-        return await self._run_with_plan(query, tools, rag_context, session_id)
+            if classification.complexity == "simple":
+                return await self._run_react(query, tools, session_id)
+            else:
+                # multi_step: 加载 Skills + RAG，走 PlanExecute
+                rag_context = await self._load_rag(query, user)
+                matched_skills = self.skills.match_skills(query)
+                return await self._run_with_plan(query, tools, rag_context, matched_skills, session_id)
 
     def _load_tools(self, query, classification):
-        """只给 tool/complex 意图加载工具，qa/knowledge 不加载"""
+        """只给 action 意图加载工具，qa/knowledge 不加载"""
         if classification.intent in ("qa", "knowledge"):
             return []
         all_tools = self.tools.list_all()
@@ -554,13 +667,391 @@ SA_RUNTIME_ENABLE_PLAN=true       # 是否启用 PlanExecute
 
 ---
 
-## 5. Skills（技能）
+
+
+---
+
+## 5. Agent State（执行状态管理）
 
 ### 5.1 定义
 
+Agent State 是 Agent 执行全过程的**统一状态容器**。它在 ReAct 循环中驱动 LLM 决策，在服务重启后恢复会话，在会话结束时归档审计。
+
+```
+Agent State 的三个职责：
+
+1. 驱动执行  <-  ReAct / PlanExecute 循环读写 state.messages + state.steps
+2. 持久恢复  <-  Redis 快照，服务重启后 restore 继续执行
+3. 审计归档  <-  MySQL 持久化，Part C 链路追踪直接复用
+```
+
+### 5.2 State 数据结构
+
+```python
+@dataclass
+class AgentState:
+    # ── 身份与上下文 ──
+    user_id: str
+    session_id: str
+    query: str
+
+    # ── Classifier 产出 ──
+    intent: Literal["qa", "knowledge", "action"]
+    risk: Literal["low", "medium", "high"]
+    complexity: Literal["simple", "multi_step"]
+    # plan_needed 由 complexity 决定：multi_step → PlanExecute
+
+    # ── 运行时加载的能力 ──
+    task: str                                   # 规格化任务描述
+    tools: list[Tool]
+    rag_context: list[Chunk] | None
+    matched_skills: list[SkillMeta]             # L1 匹配
+    current_skill_content: SkillContent | None  # L2 加载的完整 SKILL.md
+
+    # ── 执行进度 ──
+    messages: list[dict]                        # LLM 对话历史，驱动 ReAct 循环
+    plan: Plan | None
+    steps: list[PlannedStep]                    # 计划步骤列表
+    step_index: int = 0                         # 当前执行到第几步
+
+    # ── 调用记录 ──
+    tool_calls: list[ToolCallRecord]            # [{tool, params, result, duration_ms, status}]
+    observations: list[Any]                     # 工具返回结果
+
+    # ── 审批 ──
+    approval_status: Literal["none", "pending", "approved", "rejected"] = "none"
+
+    # ── 执行控制 ──
+    max_steps: int = 10
+    started_at: float
+    finished_at: float | None = None
+    execution_result: str | None = None
+
+
+@dataclass
+class ToolCallRecord:
+    name: str
+    params: dict
+    result: Any
+    duration_ms: int
+    status: Literal["success", "error", "timeout", "rejected"]
+    timestamp: float
+```
+
+### 5.3 持久化方案
+
+分三层，按数据的实时性和生命周期决定存储介质：
+
+```
+                     Agent Runtime
+                         |
+                   AgentState（内存）
+                  当前活动会话，热数据
+                  服务重启后丢失
+                         |
+             +-----------+-----------+
+             |                       |
+          Redis                   MySQL
+      会话级快存（TTL）         持久化归档
+      key: state:{id}           table: agent_sessions
+      TTL: 30min + 缓冲         查询、审计、复盘
+```
+
+#### 内存层
+
+Agent Runtime 的 ReAct 循环全程操作内存中的 AgentState 对象，不涉及 I/O。每步结束时调用 `StateManager.save_snapshot()` 异步刷 Redis。
+
+#### Redis 层
+
+```python
+# Redis Hash: 存结构化字段
+# key = f"agent:state:{session_id}"
+
+HSET agent:state:xxx \
+  user_id          "u_123" \
+  intent           "action" \
+  complexity       "multi_step" \
+  task             "排查 MySQL 主从延迟" \
+  plan             "{...}"           # Plan JSON
+  step_index       "2" \
+  approval_status  "pending" \
+  tool_calls       "[{tool, params, duration_ms, status}]"
+
+EXPIRE agent:state:xxx 1800  # 30 分钟 TTL，每次活跃刷新
+
+# Redis Stream: 存 messages（量大，不适合放 Hash）
+# key = f"agent:state:{session_id}:messages"
+
+XADD agent:state:xxx:messages * role user content "查一下延迟"
+XADD agent:state:xxx:messages * role assistant content "正在查询..."
+XADD agent:state:xxx:messages * role tool name mysql_query result "{...}"
+```
+
+#### MySQL 层
+
+```sql
+CREATE TABLE agent_sessions (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id      VARCHAR(64) NOT NULL,
+    user_id         VARCHAR(64) NOT NULL,
+
+    -- 会话信息
+    query           TEXT,
+    intent          VARCHAR(16),
+    task            VARCHAR(256),
+
+    -- 进度状态
+    status          VARCHAR(16) DEFAULT 'active',  -- active / paused / completed / failed / timeout
+    plan            JSON,
+    steps           JSON,
+    step_index      INT DEFAULT 0,
+    approval_status VARCHAR(16) DEFAULT 'none',
+
+    -- 调用记录
+    tool_calls      JSON,
+    observations    JSON,
+
+    -- 完整数据
+    messages        MEDIUMTEXT,        -- 完整对话历史
+    execution_result TEXT,
+
+    -- 时间
+    started_at      DATETIME(3),
+    updated_at      DATETIME(3),
+    finished_at     DATETIME(3),
+
+    INDEX idx_session (session_id),
+    INDEX idx_user (user_id, started_at),
+    INDEX idx_status (status),
+    INDEX idx_finished (finished_at)
+);
+```
+
+### 5.4 StateManager
+
+```python
+class StateManager:
+    """
+    Agent State 的读写入口。
+
+    Part C 的全链路追踪直接复用本类写入的 agent_sessions 表、
+    trace_events 钩子，不做重复埋点。
+    """
+
+    def __init__(self, redis, db):
+        self.redis = redis
+        self.db = db
+
+    async def create(self, session_id: str, query: str, user_id: str) -> AgentState:
+        """新建会话，初始化 State。"""
+        state = AgentState(
+            session_id=session_id,
+            user_id=user_id,
+            query=query,
+            started_at=time.time(),
+            max_steps=settings.runtime.max_steps,
+        )
+        await self._save_redis(state)
+        return state
+
+    async def save_snapshot(self, state: AgentState):
+        """
+        每步 ReAct 循环结束后调用，异步写 Redis 快照。
+
+        设计要点:
+          1. messages 单独写到 Redis Stream（避免 Hash 读写大对象）
+          2. tool_calls 只保留最近 10 条（全量在 MySQL 归档时写入）
+          3. 异步 fire-and-forget，不阻塞主循环
+        """
+        key = f"agent:state:{state.session_id}"
+        await self.redis.hset(key, mapping={
+            "user_id": state.user_id,
+            "intent": state.intent,
+            "task": state.task,
+            "plan": json.dumps(asdict(state.plan)) if state.plan else None,
+            "steps": json.dumps(state.steps),
+            "step_index": state.step_index,
+            "approval_status": state.approval_status,
+            "tool_calls": json.dumps(state.tool_calls[-10:]),
+        })
+        await self.redis.expire(key, 1800)
+
+    async def restore(self, session_id: str) -> AgentState | None:
+        """服务重启后恢复会话。从 Redis 重建结构化字段 + Stream 恢复 messages。"""
+        key = f"agent:state:{session_id}"
+        data = await self.redis.hgetall(key)
+        if not data:
+            return None
+        state = AgentState(**data)
+        # 从 Stream 恢复 messages
+        msg_key = f"agent:state:{session_id}:messages"
+        raw = await self.redis.xrange(msg_key, "-", "+")
+        state.messages = [json.loads(m["data"]) for _, m in raw]
+        return state
+
+    async def archive(self, state: AgentState):
+        """
+        会话完成/超时/失败后归档到 MySQL。
+
+        Part C 的 OpenTelemetry 追踪直接读此表数据，
+        不做二次埋点。
+        """
+        await self.db.execute("""
+            INSERT INTO agent_sessions
+            (session_id, user_id, query, intent, task, status,
+             plan, steps, step_index, approval_status,
+             tool_calls, observations, messages, execution_result,
+             started_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+        """, state.session_id, state.user_id, state.query, state.intent,
+            state.task, "completed", json.dumps(asdict(state.plan)),
+            json.dumps(state.steps), state.step_index, state.approval_status,
+            json.dumps(state.tool_calls), json.dumps(state.observations),
+            json.dumps(state.messages), state.execution_result, state.started_at)
+        # 清理 Redis
+        keys = [f"agent:state:{state.session_id}", f"agent:state:{state.session_id}:messages"]
+        for k in keys:
+            await self.redis.delete(k)
+```
+
+### 5.5 TraceEvent 扩展点（为 Part C 预留）
+
+Part A 只埋点不消费，Part C 消费不重埋：
+
+```sql
+-- Part A 定义表结构并写入数据
+-- Part C 的 OpenTelemetry 直接读此表，无需重复埋点
+CREATE TABLE agent_trace_events (
+    id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id       VARCHAR(64) NOT NULL,
+
+    -- 事件定位
+    phase            VARCHAR(16),       -- guardrails / classifier / runtime / planexecute / hitl
+    step_index       INT DEFAULT 0,     -- ReAct 步数
+    event_type       VARCHAR(32),       -- guardrails_check / classify / llm_call / tool_execute / skill_load
+
+    -- 事件内容
+    input            JSON,
+    output           JSON,
+    duration_ms      INT,
+    status           VARCHAR(16),       -- success / error / blocked / timeout
+
+    -- 关联
+    parent_event_id  BIGINT NULL,       -- 形成调用树
+    trace_id         VARCHAR(64) NULL,  -- Part C 写入 OTel trace_id，Part A 留空
+
+    created_at       DATETIME(3),
+    INDEX idx_session (session_id, phase),
+    INDEX idx_phase  (phase, created_at)
+);
+```
+
+```python
+class TraceEventRecorder:
+    """
+    Part A 在关键路径调用 record()，只记录不入 OpenTelemetry。
+
+    Part C 对接 OTel 时有两条路：
+      A) 继续使用本表，在 trace_id 字段写入 OTel span_id
+      B) 用本表数据生成 OTel Span，双写
+
+    无论哪种方案，Part A 的埋点代码都不需要改动。
+    """
+
+    def __init__(self, db):
+        self.db = db
+
+    async def record(self, event: TraceEvent):
+        """异步写入 trace_events 表，不阻塞主流程。"""
+        await self.db.execute("""
+            INSERT INTO agent_trace_events
+            (session_id, phase, step_index, event_type,
+             input, output, duration_ms, status, parent_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, event.session_id, event.phase, event.step_index,
+            event.event_type, event.input, event.output,
+            event.duration_ms, event.status, event.parent_event_id)
+```
+
+**埋点位置**：
+
+| 埋点位置 | event_type | 用途 |
+|---------|-----------|------|
+| Guardrails 检测后 | `guardrails_check` | 记录拦截/放行决策 |
+| Classifier 判定后 | `classify` | 记录判定依据 + 耗时 |
+| Runtime 加载能力后 | `load_tools` / `load_rag` / `skill_match` | 记录加载了什么能力 |
+| 每步 LLM 调用后 | `llm_call` | 记录 LLM 思考 + Token 消耗 |
+| 每步工具调用后 | `tool_execute` | 记录工具名称、参数、结果、耗时 |
+| HITL 创建/审批后 | `hitl_request` / `hitl_approve` | 记录审批流转 |
+| PlanExecute 步骤后 | `plan_step` | 记录每一步的执行状态 |
+
+### 5.6 数据流整合（State 如何贯穿全程）
+
+```
+用户请求
+    |
+    +- Guardrails
+    |   +- record(guardrails_check)
+    |
+    +- Classifier
+    |   +- record(classify)
+    |
+    +- Runtime 初始化 State（create）
+    |   +- _load_tools     -> record(load_tools)
+    |   +- _load_rag       -> record(load_rag)
+    |   +- skills.match    -> record(skill_match)
+    |   |
+    |   +- ReAct 循环（每步）
+    |       +- LLM 调用        -> record(llm_call)
+    |       +- save_snapshot   -> Redis 快照
+    |       +- 工具调用        -> record(tool_execute)
+    |       +- HITL 检查       -> record(hitl_request)
+    |       +- <- 回到循环
+    |
+    +- 完成
+    |   +- archive -> MySQL agent_sessions + trace_events
+    |
+    +- Part C: OpenTelemetry 直接读 MySQL，不重复埋点
+```
+
+### 5.7 配置
+
+```bash
+# Agent State / Trace 相关配置直接复用 Part C 的配置项，不做两套
+# SA_OTEL_ENABLED 等由 Part C 统一管理
+
+# Part A 只控制 State 相关的：
+SA_STATE_REDIS_TTL=1800            # Redis 快照 TTL（秒）
+SA_STATE_MAX_TOOL_RECORDS=10       # Redis 中保留的最近 tool_call 记录数
+SA_STATE_TRACE_ENABLED=true         # 是否写入 trace_events 表（Part C 依赖此数据）
+```
+
+### 5.8 Part C 复用说明
+
+```
+Part A 产出                    Part C 消费
+──────────────────────────────────────────────
+agent_sessions 表              OTel 直接读此表，不做二次埋点
+trace_events 表                OTel 读取后关联 trace_id，或双写到 Jaeger
+AgentState.messages            用于生成 Span 调用链（parent/child 关系）
+tool_calls / observations      用于生成工具调用的 Span
+
+设计原则：
+  1. Part A 负责"写"，Part C 负责"读+展示"
+  2. Part C 不新增同级别埋点表。如果 OTel 需要额外字段，
+     在 trace_events 加字段而非新建表
+  3. Part A 不依赖任何 OTel SDK。Part C 引入 OTel 时无需改 Part A 代码
+```
+
+---
+
+## 6. Skills（技能）
+
+### 6.1 定义
+
 Skills 是**可复用的能力单元**，每个 Skill 封装了一组特定领域的知识和操作流程。可以理解成"预制的 Agent 能力包"。
 
-### 5.2 Skills vs Tools 的区别
+### 6.2 Skills vs Tools 的区别
 
 | 维度 | Skills | Tools |
 |------|--------|-------|
@@ -569,7 +1060,7 @@ Skills 是**可复用的能力单元**，每个 Skill 封装了一组特定领�
 | 执行 | 自己驱动执行流程 | 被 LLM 调用 |
 | 示例 | "MySQL 故障排查 Skill"（包含：检查连接 → 查慢查询 → 分析日志 → 生成报告） | "mysql_query"（只执行一条 SQL） |
 
-### 5.3 类比
+### 6.3 类比
 
 ```
 Tool 是"一把螺丝刀"——只能拧螺丝
@@ -578,7 +1069,7 @@ Skill 是"换轮胎流程"——包含：支千斤顶 → 卸螺丝 → 换胎 �
 
 Skill 内部可以调用多个 Tools。
 
-### 5.4 Skill 接口
+### 6.4 Skill 接口
 
 ```python
 class BaseSkill(ABC):
@@ -624,7 +1115,7 @@ class MySQLTroubleshootingSkill(BaseSkill):
         )
 ```
 
-### 5.5 Skills 在架构中的位置
+### 6.5 Skills 在架构中的位置
 
 ```
 Agent Runtime 决定调用哪个 Skill
@@ -633,18 +1124,22 @@ Skill 执行自己的流程（可能包含多个工具调用）
          ↓
 每个工具调用 → 经过 HITL 检查 → Execution
          ↓
+Skill 有 scripts/ 目录 → 脚本走 Docker 沙箱执行
+         ↓
 Skill 返回结果 → Runtime 继续
 ```
 
+> **沙箱规则**：所有有 `scripts/` 目录的 Skill，脚本执行强制走 Docker 沙箱。SKILL.md 的 `metadata.sandbox` 字段声明使用哪个 profile（详见 §12.3 Docker 沙箱）。纯指令型 Skill（只有 SKILL.md + references，无 scripts/）不走沙箱。
+
 ---
 
-## 6. RAG（知识检索）
+## 7. RAG（知识检索）
 
-### 6.1 定义
+### 7.1 定义
 
 RAG 层负责在 Agent 执行时**按需注入相关知识**。它是 Agent 的"长期记忆"。
 
-### 6.2 在单 Agent 架构中的角色
+### 7.2 在单 Agent 架构中的角色
 
 RAG 不再是独立 Agent 的专属能力，而是 Runtime 的一个**可选能力注入源**：
 
@@ -660,7 +1155,7 @@ RAG 层返回检索结果（chunks）
 LLM 基于知识回答
 ```
 
-### 6.3 决策策略
+### 7.3 决策策略
 
 **核心原则：先查再说，有结果用企业知识，无结果 LLM 兜底。**
 
@@ -669,7 +1164,7 @@ LLM 基于知识回答
 | "你好" | 不查知识库 | Classifier 标记为 qa，跳过 RAG |
 | "什么是主从复制" | 查知识库 → 有结果用文档 → 无结果 LLM 答 | 企业可能有自建 MySQL 的规范文档 |
 | "公司的年假政策" | 查知识库 → 返回 HR 文档结果 | RAG 覆盖全企业知识，不限于 IT |
-| "重启 10.0.1.5" | 不查知识库 | intent=tool，工具直接执行，知识库帮不上忙 |
+| "重启 10.0.1.5" | 不查知识库 | intent=action，工具直接执行，知识库帮不上忙 |
 | "K8s Pod 起不来怎么排查" | 查知识库 → 有结果用文档 → 无结果 LLM 兜底 | 企业可能有自建 K8s 的排障手册 |
 
 **Fallback 流程：**
@@ -687,7 +1182,11 @@ Runtime 发起 RAG 检索
 
 > **设计意图**：不要求知识库面面俱到。文档覆盖到的用企业知识，覆盖不到的 LLM 兜底。降低维护压力，同时保证已有文档的价值最大化。
 
-### 6.4 RAG 筛选
+#### 7.3.1 前端视觉区分
+
+RAG 检索无结果时，后端通过 SSE 事件 `{"type": "source", "source": "llm_fallback"}` 标记该回答为非知识库结果。前端在 `case 'source'` 事件中检测 `llm_fallback`，为消息气泡添加 `llm-fallback` CSS 类，应用淡黄底色（`#fffbe6`）+ 左侧 amber 边框（`#faad14`），与正常知识库回答形成视觉区分。
+
+### 7.4 RAG 筛选
 
 RAG 层的知识库选择基于用户上下文：
 
@@ -701,13 +1200,13 @@ rag_sources = rag_manager.select(
 
 ---
 
-## 7. Tools（工具）
+## 8. Tools（工具）
 
-### 7.1 定义
+### 8.1 定义
 
 Tools 是 Agent 与外部系统交互的**执行单元**。每个 Tool 封装一个具体操作。
 
-### 7.2 Tool 接口
+### 8.2 Tool 接口
 
 ```python
 class BaseTool(ABC):
@@ -721,7 +1220,7 @@ class BaseTool(ABC):
     async def execute(self, **params) -> ToolResult: ...
 ```
 
-### 7.3 Tool 示例
+### 8.3 Tool 示例
 
 ```python
 class MySQLQuery(BaseTool):
@@ -763,7 +1262,7 @@ class ServerRestart(BaseTool):
         return ToolResult(success=True, data=result)
 ```
 
-### 7.4 Tools 生命周期
+### 8.4 Tools 生命周期
 
 ```
 注册：服务启动时，所有 Tool 注册到 ToolRegistry
@@ -773,17 +1272,17 @@ class ServerRestart(BaseTool):
 
 ---
 
-## 8. PlanExecute（复杂任务管线）
+## 9. PlanExecute（复杂任务管线）
 
-### 8.1 定义
+### 9.1 定义
 
-PlanExecute 不是 Agent 模式，而是 **Runtime 的一个可选组件**。只有在 Classifier 判定 `plan_needed=true` 时才启用。
+PlanExecute 不是 Agent 模式，而是 **Runtime 的一个可选组件**。只有在 Classifier 判定 `complexity=multi_step` 时才启用。
 
-### 8.2 流程
+### 9.2 流程
 
 ```
 Planner:    用户请求 → 拆解为有序步骤
-Executor:   按顺序执行每步（每步可能调工具、查知识、调技能）
+Executor:   按顺序执行每步（每步可能调工具、查知识、参考 SKILL.md 指导）
 Re-planner: 每步完成后检查结果，必要时调整后续计划
 
 Planner: "排查 MySQL 主从延迟"
@@ -798,7 +1297,7 @@ Executor → Step3 审批通过 → 执行 → Re-planner 检查 → 继续 Step
 Executor → Step4 完成 → Planner 汇总结果
 ```
 
-### 8.3 与 ReAct 的区别
+### 9.3 与 ReAct 的区别
 
 | 对比 | ReAct | PlanExecute |
 |------|-------|-------------|
@@ -808,7 +1307,7 @@ Executor → Step4 完成 → Planner 汇总结果
 | 使用场景 | 单步工具调用 | 多步排查流程 |
 | 执行时间 | 秒级 | 分钟级 |
 
-### 8.4 Plan 数据结构
+### 9.4 Plan 数据结构
 
 ```python
 @dataclass
@@ -836,9 +1335,9 @@ class PlanResult:
 
 ---
 
-## 9. MCP Tools（外部工具集成）
+## 10. MCP Tools（外部工具集成）
 
-### 9.1 定义
+### 10.1 定义
 
 MCP（Model Context Protocol）是一个标准协议，用于 Agent 发现和调用**外部系统的能力**。
 
@@ -852,7 +1351,7 @@ MCP Tools 与内部 Tools 的区别：
 | 生命周期 | 应用启动时加载 | 按需连接 |
 | 示例 | mysql_query | 外部 CMDB 查询、告警平台 API |
 
-### 9.2 在架构中的位置
+### 10.2 在架构中的位置
 
 ```
 Agent Runtime → 需要调用外部能力
@@ -864,7 +1363,7 @@ MCP Server（外部部署）→ 返回结果
 结果注入 Runtime → 继续执行
 ```
 
-### 9.3 MCP Tool 生命周期
+### 10.3 MCP Tool 生命周期
 
 ```
 1. 服务启动时：MCP Manager 连接所有配置的 MCP Server
@@ -873,7 +1372,7 @@ MCP Server（外部部署）→ 返回结果
 4. 运行时：LLM 无差别调用内部 Tool 和 MCP Tool
 ```
 
-### 9.4 配置
+### 10.4 配置
 
 ```
 SA_MCP_SERVERS='[
@@ -884,13 +1383,13 @@ SA_MCP_SERVERS='[
 
 ---
 
-## 10. Human Approval Gateway（人工审批网关）
+## 11. Human Approval Gateway（人工审批网关）
 
-### 10.1 定义
+### 11.1 定义
 
 Human Approval Gateway 是**执行前的拦截层**。当 Agent 要执行写操作时，必须等待人工确认。
 
-### 10.2 触发条件
+### 11.2 触发条件
 
 | 条件 | 说明 |
 |------|------|
@@ -898,7 +1397,7 @@ Human Approval Gateway 是**执行前的拦截层**。当 Agent 要执行写操�
 | 风险等级为 high | Classifier 判定 risk=high |
 | 安全策略要求 | Guardrails 要求审批 |
 
-### 10.3 流程
+### 11.3 流程
 
 ```
 Agent Runtime 决定执行 server_restart("slave-01")
@@ -923,7 +1422,7 @@ Gateway 收到审批通过:
   → 记录审计日志
 ```
 
-### 10.4 审批结果
+### 11.4 审批结果
 
 | 结果 | 行为 |
 |------|------|
@@ -931,7 +1430,7 @@ Gateway 收到审批通过:
 | reject | Agent 返回"操作被驳回"，停止当前步骤 |
 | timeout（300s） | 自动驳回 |
 
-### 10.5 配置
+### 11.5 配置
 
 ```
 SA_HITL_ENABLED=true                   # 总开关
@@ -941,26 +1440,137 @@ SA_HITL_RISK_THRESHOLD=high            # 触发审批的最低风险等级
 
 ---
 
-## 11. Execution（执行层）
+## 12. Execution（执行层）
 
-### 11.1 定义
+### 12.1 定义
 
-Execution 是整个流程的**实际执行者**。所有 Tools、Skills、MCP 调用的结果都在这一层落地。
+Execution 是整个流程的**实际执行者**。所有 Tools（含内部和 MCP）的执行结果、Skills 的资源加载（L3 scripts/ / references/）都在这一层落地。Skill 的脚本执行强制经过 **Docker 沙箱**隔离，不存在"受信脚本跳过沙箱"的例外。
 
-### 11.2 职责
+### 12.2 职责
 
 ```
 1. 执行工具调用（mysql_query, server_restart 等）
 2. 执行 MCP 调用（外部系统）
-3. 执行技能步骤（Skill 内部流程）
+3. 按需加载 Skills 的 L3 资源（scripts/ / references/ / assets/）
 4. 超时管理
 5. 重试管理（失败重试）
 6. 结果收集和格式化
+
+
+```
+
+### 12.3 Docker 沙箱
+
+#### 12.3.1 定义
+
+Docker 沙箱为**所有 Skill 的脚本执行**提供隔离环境。无论 skill 来源是内部开发还是社区下载，有 `scripts/` 目录就走沙箱，不存在"受信 skill 跳过沙箱"的例外。
+
+覆盖四种场景：
+
+| Profile | 网络 | 文件系统 | 超时 | 内存 | CPU | 适用场景 |
+|---------|------|---------|------|------|-----|---------|
+| `code` | 无 | 临时只读挂载 | 30s | 256MB | 0.5 | Python 代码执行、数据处理 |
+| `ops` | 白名单（内网） | 只读挂载 config | 60s | 512MB | 1 | 运维脚本、查询命令 |
+| `skill` | 无 | 只读挂载脚本目录 | 120s | 1GB | 2 | 外部 Skill 的 scripts/ |
+| `pipeline` | 有 | 读写挂载数据目录 | 300s | 2GB | 4 | ETL、数据管道 |
+
+#### 12.3.2 在架构中的位置
+
+```
+Agent Runtime → Execution 层
+         ↓
+执行脚本 → DockerSandbox（所有 skill 脚本强制走沙箱）
+         ↓
+    选择 profile（SKILL.md 的 metadata.sandbox 声明）
+        ├── skill （默认，无网络，只读挂载脚本目录）
+        ├── code  （数据处理，完全隔离）
+        ├── ops   （运维操作，内网白名单）
+        └── pipeline（数据管道，有网络+读写）
+         ↓
+    ├── 创建容器（镜像缓存、网络隔离、资源限制）
+    ├── 挂载必要数据（只读）
+    ├── 注入超时和重试策略
+    ├── 执行脚本
+    ├── 收集 stdout/stderr
+    └── 销毁容器
+          ↓
+    返回结果 → LLM context
+```
+
+**不经过沙箱的例外**：只有两种情况不走沙箱 ——
+- Skill 只有 SKILL.md + references，没有 scripts/ 目录（纯指令型）
+- `SA_SANDBOX_ENABLED=false`（开发调试时关闭）
+
+其余所有有 `scripts/` 的 skill，无论来源是否受信，一律走 Docker 沙箱。
+
+#### 12.3.3 SKILL.md 沙箱声明
+
+SKILL.md 中用 `metadata.sandbox` 字段声明**使用哪个 profile**，而不是声明"要不要走沙箱"：
+
+```yaml
+---
+name: mysql-troubleshooting
+metadata:
+  sandbox: ops               # 使用 ops profile（内网白名单，512MB）
+  sandbox_network: true      # 需要访问内网 MySQL
+---
+
+name: data-analysis
+metadata:
+  sandbox: code              # 使用 code profile（无网络，256MB）
+---
+
+name: my-company-internal-skill
+# 不声明 sandbox 字段，不等于跳过沙箱
+# 默认使用 skill profile（无网络，1GB，只读挂载）
+```
+
+**默认行为**：有 `scripts/` 目录但 SKILL.md 未声明 `metadata.sandbox` → 默认走 `skill` profile。不存在"不声明就不走沙箱"的路径。
+
+#### 12.3.4 实现
+
+```python
+@dataclass
+class SandboxProfile:
+    image: str                   # 基础镜像
+    network_disabled: bool       # 是否禁用网络
+    mem_limit: str               # 内存限制
+    cpu_limit: float             # CPU 限制
+    timeout: int                 # 超时秒数
+    read_only: bool              # 文件系统只读
+    mounts: list[str]            # 挂载路径列表
+
+
+class DockerSandbox:
+    PROFILES = {
+        "code": SandboxProfile(image="python:3.12-slim", ...),
+        "ops":  SandboxProfile(image="alpine:latest", ...),
+        "skill": SandboxProfile(image="python:3.12-slim", network_disabled=True, ...),
+        "pipeline": SandboxProfile(image="python:3.12", ...),
+    }
+
+    async def run(self, script_path: str, profile: str, mounts: list[tuple[str, str]]) -> SandboxResult:
+        """创建容器 → 挂载 → 执行 → 收集结果 → 销毁"""
+        ...
+
+    async def run_code(self, code: str, language: str = "python") -> SandboxResult:
+        """直接执行代码片段（code profile）"""
+        ...
+```
+
+#### 12.3.5 配置
+
+```bash
+SA_SANDBOX_ENABLED=true              # 沙箱总开关
+SA_SANDBOX_DEFAULT_PROFILE=code      # 默认沙箱等级
+SA_SANDBOX_DOCKER_TIMEOUT=120        # 容器执行超时（秒）
+SA_SANDBOX_NETWORK_WHITELIST=        # 内网白名单
+SA_SANDBOX_IMAGE_PULL=true           # 是否自动拉取镜像
 ```
 
 ---
 
-## 12. 完整数据流总结
+## 13. 完整数据流总结
 
 ```
                     Guardrails
@@ -994,7 +1604,7 @@ Execution 是整个流程的**实际执行者**。所有 Tools、Skills、MCP �
 
 ---
 
-## 13. 配置汇总
+## 14. 配置汇总
 
 所有配置项分属各模块，统一注册到 `config.py` 的 `Settings` 类：
 
@@ -1009,6 +1619,7 @@ class Settings(BaseSettings):
     session: SessionConfig = SessionConfig()
     runtime: RuntimeConfig = RuntimeConfig()
     hitl: HITLConfig = HITLConfig()
+    sandbox: SandboxConfig = SandboxConfig()   # Docker 沙箱
 
     # Phase 2 - Part C 新增
     memory: MemoryConfig = MemoryConfig()
@@ -1017,7 +1628,7 @@ class Settings(BaseSettings):
 
 ---
 
-## 14. API 端点
+## 15. API 端点
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -1031,7 +1642,7 @@ class Settings(BaseSettings):
 
 ---
 
-## 15. 测试策略
+## 16. 测试策略
 
 | 模块 | 测试重点 |
 |------|---------|
@@ -1041,3 +1652,4 @@ class Settings(BaseSettings):
 | PlanExecute | 计划生成、步骤执行、重规划触发 |
 | Tools | 各工具独立测试、超时处理、错误回传 |
 | HITL | 创建/审批/超时/驳回全流程 |
+| Docker 沙箱 | 四种 profile 隔离效果、超时销毁、资源限制、SKILL.md profile 声明解析 |

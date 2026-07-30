@@ -1,0 +1,42 @@
+{
+  "default": "work",
+  "instances": {
+    "work": {
+      "url": "https://gitlab.company.com",
+      "token": "glpat-xxxxxxxxxxxxxxxxxxxx",
+      "description": "Company GitLab instance"
+    },
+    "personal": {
+      "url": "https://gitlab.com",
+      "token": "glpat-yyyyyyyyyyyyyyyyyyyy",
+      "description": "Personal GitLab projects"
+    },
+    "client": {
+      "url": "https://gitlab.client-company.com",
+      "token": "glpat-zzzzzzzzzzzzzzzzzzzz",
+      "description": "Client project GitLab"
+    }
+  },
+  "projects": {
+    "webapp": {
+      "project_id": "acme/webapp",
+      "instance": "work",
+      "description": "Main company web application"
+    },
+    "api": {
+      "project_id": "acme/api-server",
+      "instance": "work",
+      "description": "Backend API server"
+    },
+    "blog": {
+      "project_id": "john/personal-blog",
+      "instance": "personal",
+      "description": "My personal blog"
+    },
+    "mobile": {
+      "project_id": "123",
+      "instance": "client",
+      "description": "Client mobile app (numeric ID)"
+    }
+  }
+}

@@ -99,6 +99,33 @@
   .btn-send:disabled { background: #ccc; cursor: not-allowed; }
   .btn-send svg { width: 18px; height: 18px; fill: currentColor; }
 
+  /* ── Mode Selector ── */
+  .mode-selector {
+    appearance: none; -webkit-appearance: none; -moz-appearance: none;
+    background: #f0f2f5; border: 1px solid #e8e8e8; border-radius: 6px;
+    padding: 4px 28px 4px 10px; font-size: 13px; font-family: inherit;
+    color: #333; cursor: pointer; outline: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='%23666'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 6px center;
+  }
+  .mode-selector:hover { border-color: #667eea; }
+  .mode-selector:focus { border-color: #667eea; box-shadow: 0 0 0 2px rgba(102,126,234,0.15); }
+
+  /* ── Agent Event Bubbles ── */
+  .event-bubble {
+    align-self: flex-start; font-size: 12px; color: #888; padding: 2px 0;
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  }
+  .event-bubble .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
+  }
+  .tag-intent { background: #e6f7ff; color: #1890ff; }
+  .tag-tool-call { background: #fff7e6; color: #fa8c16; }
+  .tag-tool-result { background: #f6ffed; color: #52c41a; }
+  .tag-step { background: #f0f0f0; color: #666; }
+  .tag-guardrails { background: #fff2f0; color: #ff4d4f; }
+  .tag-guardrails-warn { background: #fffbe6; color: #faad14; }
+
   /* ── Error ── */
   .error-msg { color: #ff4d4f; background: #fff2f0; padding: 8px 12px; border-radius: 8px; font-size: 13px; margin-top: 4px; }
 
@@ -123,7 +150,10 @@
   <div class="header">
     <div class="header-left">
       <h1>Super Agent</h1>
-      <span class="badge">知识库</span>
+      <select class="mode-selector" id="modeSelector" onchange="onModeChange()">
+        <option value="knowledge">知识库</option>
+        <option value="agent">智能体</option>
+      </select>
     </div>
     <div class="header-right">
       <span id="userDisplay"></span>
@@ -151,14 +181,12 @@
 </div>
 
 <script>
-const STATE = { userId: '', username: '', loading: false };
+const STATE = { userId: '', username: '', loading: false, mode: 'knowledge' };
 
-const SUGGESTIONS = [
-  '告警频率多少算异常',
-  '如何查看历史告警',
-  '告警自动恢复机制',
-  '网络故障排查步骤',
-];
+const SUGGESTIONS = {
+  knowledge: ['告警频率多少算异常', '如何查看历史告警', '告警自动恢复机制', '网络故障排查步骤'],
+  agent: ['查一下echo服务', '服务器状态怎么样', '什么是主从复制', '你好'],
+};
 
 // ── Init ──
 (async () => {
@@ -187,6 +215,33 @@ function showChat() {
 
 function logout() {
   window.location.href = '/auth/logout';
+}
+
+function onModeChange() {
+  STATE.mode = document.getElementById('modeSelector').value;
+  // Clear messages
+  document.getElementById('messages').innerHTML = '';
+  // Update suggestions
+  renderSuggestions();
+  // Update placeholder
+  document.getElementById('input').placeholder = STATE.mode === 'agent' ? '输入问题，与 AI 智能体对话...' : '输入你的问题...';
+  // Show suggestions
+  document.getElementById('suggestions').style.display = 'flex';
+}
+
+function renderSuggestions() {
+  const container = document.getElementById('suggestions');
+  const chips = SUGGESTIONS[STATE.mode] || SUGGESTIONS.knowledge;
+  container.innerHTML = chips.map(s => `<span class="suggestion-chip">${s}</span>`).join('');
+  container.querySelectorAll('.suggestion-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      input.value = chip.textContent;
+      sendBtn.disabled = false;
+      input.focus();
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    });
+  });
 }
 
 // ── Send Message ──
@@ -223,11 +278,16 @@ async function sendMessage() {
   const contentDiv = assistantDiv.querySelector('.content');
   contentDiv.classList.add('stream-cursor');
 
+  const endpoint = STATE.mode === 'agent' ? '/agent/chat/stream' : '/rag/query/stream';
+  const body = STATE.mode === 'agent'
+    ? JSON.stringify({ query: text })
+    : JSON.stringify({ query: text, top_k: 5 });
+
   try {
-    const res = await fetch('/rag/query/stream', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: text, top_k: 5 }),
+      body,
     });
 
     if (!res.ok) {
@@ -240,47 +300,75 @@ async function sendMessage() {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let processedLen = 0;
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
-      // 只处理未处理过的完整事件
-      const newData = buffer.slice(processedLen);
-      const lastDelim = newData.lastIndexOf('\n\n');
-      if (lastDelim === -1) continue;
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
 
-      const complete = newData.slice(0, lastDelim);
-      processedLen += lastDelim + 2;
-
-      for (const line of complete.split('\n\n')) {
+      for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         try {
-          const data = JSON.parse(line.slice(6));
-          switch (data.type) {
+          const event = JSON.parse(line.slice(6));
+          switch (event.type) {
             case 'token':
-              contentDiv.textContent += data.text;
+              contentDiv.textContent += event.text;
               messages.scrollTop = messages.scrollHeight;
               break;
+            case 'guardrails':
+              const tagClass = event.verdict === 'block' ? 'tag-guardrails' : 'tag-guardrails-warn';
+              addEventBubble(`<span class="tag ${tagClass}">安全检测: ${event.reason}</span>`);
+              if (event.verdict === 'block') {
+                contentDiv.textContent = '请求被安全拦截';
+                contentDiv.classList.remove('stream-cursor');
+              }
+              break;
+            case 'intent':
+              if (event.tools) {
+                addEventBubble(`<span class="tag tag-intent">意图: ${event.intent}</span> <span class="tag tag-tool-call">工具: ${event.tools.join(', ')}</span>`);
+              } else {
+                addEventBubble(`<span class="tag tag-intent">意图: ${event.intent}</span>`);
+              }
+              break;
+            case 'step':
+              addEventBubble(`<span class="tag tag-step">步骤 ${event.step}/${event.max_steps}</span>`);
+              break;
+            case 'tool_call':
+              addEventBubble(`<span class="tag tag-tool-call">调用 ${event.name}(${JSON.stringify(event.params)})</span>`);
+              break;
+            case 'tool_result':
+              const okIcon = event.success ? '' : '';
+              addEventBubble(`<span class="tag tag-tool-result">${okIcon} ${event.name}: ${JSON.stringify(event.data || event.error)}</span>`);
+              break;
+            case 'source':
+              if (event.source === 'llm_fallback') {
+                addEventBubble(`<span class="tag tag-guardrails-warn">⚠️ AI 补充回答</span>`);
+              }
+              break;
             case 'sources':
+              contentDiv.classList.remove('stream-cursor');
+              if (event.sources && event.sources.length) {
+                renderCitations(assistantDiv, event.sources);
+              }
               break;
             case 'citations':
               contentDiv.classList.remove('stream-cursor');
-              if (data.citations && data.citations.length) {
-                renderCitations(assistantDiv, data.citations);
+              if (event.citations && event.citations.length) {
+                renderCitations(assistantDiv, event.citations);
               }
               break;
             case 'done':
               contentDiv.classList.remove('stream-cursor');
               break;
             case 'error':
-              contentDiv.textContent = '出错了: ' + data.message;
+              contentDiv.textContent = '出错了: ' + event.message;
               contentDiv.classList.remove('stream-cursor');
               break;
           }
-        } catch { /* skip partial JSON */ }
+        } catch { /* skip partial */ }
       }
     }
     contentDiv.classList.remove('stream-cursor');
@@ -295,6 +383,14 @@ async function sendMessage() {
 }
 
 // ── UI Helpers ──
+function addEventBubble(html) {
+  const div = document.createElement('div');
+  div.className = 'event-bubble';
+  div.innerHTML = html;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+}
+
 function addMessage(role, text) {
   const div = document.createElement('div');
   div.className = `message ${role}`;
@@ -345,17 +441,6 @@ function escapeHtml(str) {
   div.textContent = str;
   return div.innerHTML;
 }
-
-// ── Suggestion Chips ──
-document.querySelectorAll('.suggestion-chip').forEach(chip => {
-  chip.addEventListener('click', () => {
-    input.value = chip.textContent;
-    sendBtn.disabled = false;
-    input.focus();
-    input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-  });
-});
 </script>
 </body>
 </html>

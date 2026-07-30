@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,12 +11,14 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.concurrency import iterate_in_threadpool
 
 from super_agent.config import settings
 from super_agent.knowledge.indexer import Indexer
 from super_agent.knowledge.models import UserContext
 from super_agent.knowledge.generator import AnswerGenerator
-from super_agent.tracing.metrics import (  # Prometheus 监控指标，暴露 /metrics 端点，无基础设施时不影响运行
+from super_agent.knowledge.retrieval_pipeline import build_retriever, retrieve_chunks
+from super_agent.tracing.metrics import (
     CONTENT_TYPE_LATEST,
     GenerationTimer,
     RetrievalTimer,
@@ -75,10 +76,21 @@ class BatchQueryResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=getattr(logging, settings.server.log_level))
-    # 压制 httpx/httpcore 的 DEBUG 日志（太吵）
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     setup_tracing()
+
+    # 初始化 Agent Runtime（Phase 2）
+    # AgentRuntime 直接导入 retrieval_pipeline，不再需要注入 rag_fn
+    from super_agent.core import AgentRuntime, Guardrails, HumanApprovalGateway
+    from super_agent.api import agent as agent_api
+
+    guardrails = Guardrails()
+    hitl = HumanApprovalGateway()
+
+    rt = AgentRuntime(guardrails=guardrails, hitl=hitl)
+    agent_api.init_runtime(rt, hitl)
+
     logger.info("Super Agent starting in %s mode", settings.env)
     yield
 
@@ -94,86 +106,11 @@ from super_agent.api.sso import SSOMiddleware, register_sso_routes
 app.add_middleware(SSOMiddleware)
 register_sso_routes(app)
 
+# Agent 路由
+from super_agent.api import agent as agent_api
+app.include_router(agent_api.router)
+
 # ── Core helpers ──────────────────────────────────────────────
-
-
-def _build_reranker():
-    """根据配置构建 Reranker（默认关闭）。"""
-    if settings.rerank.provider != "remote":
-        return None
-    from super_agent.knowledge.remote_reranker import RemoteReranker
-    return RemoteReranker(
-        api_url=settings.rerank.api_url,
-        api_key=settings.rerank.api_key,
-        top_n=settings.rerank.top_n,
-    )
-
-
-def _build_retriever(user: UserContext):
-    """Build retriever based on user context.
-
-    - 无部门 → 只查公共集合 super_agent_docs
-    - 普通用户 → 查部门集合 + 公共集合（双路 RRF）
-    - 超管 → 查所有部门集合 + 公共集合
-    """
-    from super_agent.knowledge.retriever import Retriever, MultiStoreRetriever
-    from super_agent.knowledge.stores import get_store, get_all_tenant_stores
-    from super_agent.knowledge.embedders import get_embedder
-
-    embedder = get_embedder()
-    reranker = _build_reranker()
-
-    es_client = None
-    if settings.rag.enable_bm25_hybrid:
-        try:
-            from super_agent.knowledge.es_client import ESClient
-            es_client = ESClient()
-        except Exception as e:
-            logger.warning("ES client init failed, BM25 hybrid disabled: %s", e)
-
-    public_store = get_store()
-
-    if not user.department:
-        return Retriever(store=public_store, embedder=embedder, reranker=reranker, es_client=es_client)
-
-    if "admin" in user.roles:
-        dept_stores = get_all_tenant_stores()
-        all_stores = [public_store] + dept_stores
-        return MultiStoreRetriever(stores=all_stores, embedder=embedder, es_client=es_client, reranker=reranker)
-
-    dept_store = get_store(tenant_id=user.department)
-    return MultiStoreRetriever(stores=[dept_store, public_store], embedder=embedder, es_client=es_client, reranker=reranker)
-
-
-def _retrieve_chunks(
-    query: str,
-    top_k: int,
-    retriever,
-    filters: dict | None = None,
-    user: UserContext | None = None,
-) -> list:
-    """Execute retrieval with optional Query Expansion → RRF fusion."""
-    from super_agent.knowledge.query_processor import QueryProcessor
-
-    qp = QueryProcessor()
-    processed = qp.process(query)
-    search_query = processed.rewritten
-
-    all_queries = [search_query] + (processed.expansions if processed.expansions else [])
-    if len(all_queries) == 1:
-        chunks = retriever.retrieve(search_query, top_k=top_k, filters=filters, user=user)
-    else:
-        from super_agent.knowledge.retriever import reciprocal_rank_fusion
-        from super_agent.knowledge.models import SearchResult
-
-        all_results: list[list] = []
-        for q in all_queries:
-            results = retriever.retrieve(q, top_k=top_k * 2, filters=filters, user=user)
-            all_results.append([SearchResult(chunk=c, score=1.0) for c in results])
-        fused = reciprocal_rank_fusion(*all_results, k=60)
-        chunks = [r.chunk for r in fused[:top_k]]
-
-    return chunks
 
 
 def _format_sources(chunks: list) -> list[dict]:
@@ -189,7 +126,6 @@ def _format_sources(chunks: list) -> list[dict]:
 
 
 def _resolve_user(request: Request, body_user: UserContext) -> UserContext:
-    """Resolve user from SSO session or request body."""
     state_user = getattr(request, "state", None)
     if state_user and hasattr(state_user, "user"):
         user = state_user.user
@@ -201,17 +137,16 @@ def _resolve_user(request: Request, body_user: UserContext) -> UserContext:
     return body_user
 
 
-# ── Endpoints ─────────────────────────────────────────────────
+# ── Endpoints (sync, FastAPI auto-runs sync def in thread pool) ─────
 
 
 @app.get("/health")
-async def health():
+def health():
     return {"status": "ok"}
 
 
 @app.get("/metrics")
-async def metrics():
-    """Prometheus 监控指标端点，返回 rag_queries_total / 检索延迟 / 生成延迟等。"""
+def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
@@ -219,42 +154,29 @@ async def metrics():
 async def rag_query(req: QueryRequest, request: Request):
     logger.info("POST /rag/query query=%s top_k=%s filters=%s",
                 req.query[:100], req.top_k, req.filters)
-    """RAG 检索 + LLM 答案生成。
-
-    流程：Query 改写 → Embed → 向量检索 → (可选 BM25 + RRF) → (可选 Rerank) → LLM 生成答案 → 审计日志
-
-    参数（QueryRequest body）:
-        query: str                    — 用户查询原文
-        top_k: int (默认5)            — 返回的文档块数量
-        filters: dict | None          — 自定义 metadata 过滤条件
-        user: UserContext             — 用户上下文，含 user_id / roles / department / tenant_id
-        system_prompt: str | None     — 自定义 LLM 系统提示词
-        temperature: float | None     — LLM 温度参数
-
-    租户隔离策略:
-        - user.tenant_id 非空 → 仅检索该租户的独立集合（super_agent_docs_{tenant_id}）
-        - user.tenant_id 为空 → Fan-out 检索所有租户集合（admin 跨租户搜索）
-
-    返回:
-        answer: str                   — LLM 生成的答案文本
-        sources: list[dict]           — 检索到的源文档块（chunk_id / content / metadata / page_numbers）
-        citations: list[dict]         — 答案中引用的来源（chunk_id / source_doc / page_numbers / content_snippet）
-        trace_id: str                 — 追踪 ID（预留，当前为空）
-    """
     t_start = time.time()
     try:
         user = _resolve_user(request, req.user)
-        retriever = _build_retriever(user)
+        # to_thread: 将同步操作移出事件循环线程，防止阻塞 FastAPI 并发处理其他请求
+        retriever = await asyncio.to_thread(build_retriever, user)
 
-        # 查询理解 + 检索
         retrieval_timer = RetrievalTimer()
         with retrieval_timer, tracer.start_as_current_span("retrieval") as span:
-            chunks = _retrieve_chunks(
-                query=req.query, top_k=req.top_k, retriever=retriever,
-                filters=req.filters, user=user,
+            chunks = await asyncio.to_thread(
+                retrieve_chunks, req.query, req.top_k, retriever,
+                req.filters, user,
             )
             span.set_attribute("num_chunks", len(chunks))
             retrieval_timer.record_chunks(chunks)
+
+        if chunks:
+            logger.info("RAG retrieved %d chunks for query: %s", len(chunks), req.query[:60])
+            for i, c in enumerate(chunks[:3]):
+                logger.info("RAG chunk[%d]: source=%s content_preview=%s", i,
+                            c.metadata.get("file_path", "") if hasattr(c, "metadata") else "",
+                            (c.content[:200] if hasattr(c, "content") else str(c))[:200])
+        else:
+            logger.info("RAG returned 0 chunks for query: %s", req.query[:60])
 
     except Exception as e:
         logger.error("RAG query failed: %s", e)
@@ -263,14 +185,13 @@ async def rag_query(req: QueryRequest, request: Request):
 
     sources = _format_sources(chunks)
 
-    # LLM 生成答案
     gen = AnswerGenerator()
     with GenerationTimer(), tracer.start_as_current_span("answer_generation") as span:
         span.set_attribute("num_chunks", len(chunks))
         span.set_attribute("query", req.query)
-        result = gen.generate(
-            query=req.query,
-            chunks=chunks,
+        result = await asyncio.to_thread(
+            gen.generate,
+            query=req.query, chunks=chunks,
             system_prompt=req.system_prompt or settings.rag.default_system_prompt or None,
             temperature=req.temperature,
         )
@@ -291,18 +212,15 @@ async def rag_query(req: QueryRequest, request: Request):
     elapsed = time.time() - t_start
     logger.info("RAG query completed in %.2fms: %d chunks, %d citations", elapsed * 1000, len(chunks), len(citations))
 
-    # 异步审计日志（不阻塞主流程）
+    # 审计日志（异步写入，不阻塞返回）
     try:
         from super_agent.knowledge.audit import AuditLogger
 
         audit = AuditLogger()
         await audit.log_query(
-            user_id=user.user_id,
-            query=req.query,
-            num_chunks=len(chunks),
-            chunk_ids=[c.id for c in chunks],
-            answer=result.answer_text,
-            num_citations=len(citations),
+            user_id=user.user_id, query=req.query,
+            num_chunks=len(chunks), chunk_ids=[c.id for c in chunks],
+            answer=result.answer_text, num_citations=len(citations),
             latency_ms=elapsed * 1000,
         )
     except Exception:
@@ -314,36 +232,39 @@ async def rag_query(req: QueryRequest, request: Request):
 @app.post("/rag/query/stream")
 async def rag_query_stream(req: QueryRequest, request: Request):
     logger.info("POST /rag/query/stream query=%s top_k=%s", req.query[:100], req.top_k)
-    """SSE 流式 RAG 检索 + 答案生成。
 
-    与 /rag/query 功能相同，但 LLM 生成部分以 SSE 流式输出。
-    前端使用 EventSource 或 fetch + ReadableStream 消费。
-
-    SSE 事件格式：
-      data: {"type": "sources", "sources": [...]}   — 检索到的源文档
-      data: {"type": "token", "text": "..."}         — LLM 生成的 token
-      data: {"type": "citations", "citations": [...]} — 最终引用列表
-      data: {"type": "done"}                         — 完成信号
-    """
-    async def _generate() -> AsyncGenerator[str, None]:
+    async def _generate():
         try:
             user = _resolve_user(request, req.user)
-            retriever = _build_retriever(user)
+            # to_thread: 将同步操作移出事件循环线程，防止阻塞 FastAPI 并发处理其他请求
+            retriever = await asyncio.to_thread(build_retriever, user)
 
             retrieval_timer = RetrievalTimer()
             with retrieval_timer:
-                chunks = _retrieve_chunks(
-                    query=req.query, top_k=req.top_k, retriever=retriever,
-                    filters=req.filters, user=user,
+                chunks = await asyncio.to_thread(
+                    retrieve_chunks, req.query, req.top_k, retriever,
+                    req.filters, user,
                 )
                 retrieval_timer.record_chunks(chunks)
 
+            if chunks:
+                logger.info("RAG retrieved %d chunks for query: %s", len(chunks), req.query[:60])
+                for i, c in enumerate(chunks[:3]):
+                    logger.info("RAG chunk[%d]: source=%s content_preview=%s", i,
+                                c.metadata.get("file_path", "") if hasattr(c, "metadata") else "",
+                                (c.content[:200] if hasattr(c, "content") else str(c))[:200])
+            else:
+                logger.info("RAG returned 0 chunks for query: %s", req.query[:60])
+
             gen = AnswerGenerator()
-            for event in gen.generate_stream(
-                query=req.query,
-                chunks=chunks,
-                system_prompt=req.system_prompt or settings.rag.default_system_prompt or None,
-                temperature=req.temperature,
+            # iterate_in_threadpool: 将同步生成器放入线程池运行，逐次 yield 不阻塞事件循环
+            async for event in iterate_in_threadpool(
+                gen.generate_stream(
+                    query=req.query,
+                    chunks=chunks,
+                    system_prompt=req.system_prompt or settings.rag.default_system_prompt or None,
+                    temperature=req.temperature,
+                )
             ):
                 yield event
 
@@ -357,19 +278,8 @@ async def rag_query_stream(req: QueryRequest, request: Request):
 
 
 @app.post("/rag/batch-query", response_model=BatchQueryResponse)
-async def rag_batch_query(req: BatchQueryRequest):
+def rag_batch_query(req: BatchQueryRequest):
     logger.info("POST /rag/batch-query queries=%d", len(req.queries))
-    """批量 RAG 检索 + 答案生成。
-
-    同时执行多个 query 的检索和生成，适合一次问多个问题、或分块文档场景。
-    内部使用 asyncio.gather 并行执行，减少总等待时间。
-
-    参数（BatchQueryRequest body）:
-        queries: list[BatchQueryItem]  — 多个查询，每项含 query / top_k / filters / system_prompt / temperature
-
-    返回:
-        results: list[QueryResponse]   — 结果列表，与 queries 顺序一致
-    """
     from super_agent.knowledge.retriever import Retriever
     from super_agent.knowledge.embedders import get_embedder
     from super_agent.knowledge.stores import get_store
@@ -386,19 +296,18 @@ async def rag_batch_query(req: BatchQueryRequest):
 
     store = get_store()
 
-    async def _run_single(item: BatchQueryItem) -> QueryResponse:
+    def _run_single(item: BatchQueryItem) -> QueryResponse:
         try:
             retriever = Retriever(store=store, embedder=embedder, es_client=es_client)
 
-            chunks = _retrieve_chunks(
+            chunks = retrieve_chunks(
                 query=item.query, top_k=item.top_k, retriever=retriever,
                 filters=item.filters,
             )
 
             gen = AnswerGenerator()
             result = gen.generate(
-                query=item.query,
-                chunks=chunks,
+                query=item.query, chunks=chunks,
                 system_prompt=item.system_prompt or settings.rag.default_system_prompt or None,
                 temperature=item.temperature,
             )
@@ -413,7 +322,7 @@ async def rag_batch_query(req: BatchQueryRequest):
             logger.error("Batch sub-query failed: %s", e)
             return QueryResponse(answer="", sources=[])
 
-    results = await asyncio.gather(*[_run_single(item) for item in req.queries])
+    results = [_run_single(item) for item in req.queries]
     return BatchQueryResponse(results=list(results))
 
 
@@ -422,25 +331,6 @@ async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_
                      use_llm: bool = False, department: str = "", doc_level: str = "L1"):
     logger.info("POST /rag/index doc_dir=%s force=%s tenant_id=%s department=%s doc_level=%s",
                 doc_dir, force, tenant_id, department, doc_level)
-    """构建 / 重建知识库索引。
-
-    加载 doc_dir 下的文档 → 解析 → 语义切分 → Embed → 写入向量库。
-    支持增量索引（通过 MD5 文件哈希跳过未变更文件）和全量重建。
-
-    参数:
-        doc_dir: str (默认 "data/raw_docs")  — 文档目录路径
-        force: bool (默认 False)              — True = 全量重建（清空 + 重新索引）
-                                                 False = 增量索引（跳过哈希未变的文件）
-        tenant_id: str (默认 "")              — 租户标识（保留兼容，department 优先）
-        use_llm: bool (默认 False)            — True = 使用 LLM 辅助语义切分
-        department: str (默认 "")             — 部门 ID。空=公共集合，有值=对应部门集合
-        doc_level: str (默认 "L1")            — 文档密级：L1/L2/L3
-
-    返回:
-        status: str          — "indexed" 或 "rebuilt"
-        doc_dir: str         — 文档目录路径
-        total_chunks: int    — 索引完成后向量库中的总文档块数
-    """
     from super_agent.knowledge.indexer import Indexer
     from super_agent.knowledge.stores import get_store
     from super_agent.knowledge.embedders import get_embedder
@@ -457,12 +347,11 @@ async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_
     effective_tenant = department or tenant_id
     store = get_store(tenant_id=effective_tenant)
 
-    # ES BM25 混合检索客户端
     es_client = None
     if settings.rag.enable_bm25_hybrid:
         try:
             from super_agent.knowledge.es_client import ESClient
-            es_client = ESClient()
+            es_client = ESClient(tenant_id=effective_tenant)
         except Exception as e:
             logger.warning("ES client init failed, BM25 hybrid disabled: %s", e)
 
@@ -472,28 +361,17 @@ async def rag_index(doc_dir: str = "data/raw_docs", force: bool = False, tenant_
         doc_level=doc_level,
     )
     if force:
-        indexer.rebuild(doc_dir)
+        await asyncio.to_thread(indexer.rebuild, doc_dir)
     else:
-        indexer.build(doc_dir)
-    return {"status": "indexed" if not force else "rebuilt", "doc_dir": doc_dir, "total_chunks": store.count()}
+        await asyncio.to_thread(indexer.build, doc_dir)
+    total_chunks = await asyncio.to_thread(store.count)
+    return {"status": "indexed" if not force else "rebuilt", "doc_dir": doc_dir, "total_chunks": total_chunks}
 
 
 @app.post("/rag/delete", response_model=DeleteResponse)
-async def rag_delete(req: DeleteRequest):
+def rag_delete(req: DeleteRequest):
     logger.info("POST /rag/delete chunk_ids=%s tenant_id=%s department=%s",
                 len(req.chunk_ids) if req.chunk_ids else None, req.tenant_id, req.department)
-    """删除或清空向量库中的文档块。
-
-    参数（DeleteRequest body）:
-        chunk_ids: list[str] | None  — 指定要删除的 chunk ID 列表
-                                       null = 清空整个集合
-        tenant_id: str (默认 "")      — 租户标识（保留兼容，department 优先）
-        department: str (默认 "")     — 部门 ID。空=默认集合，有值=对应部门集合
-
-    返回:
-        status: str          — "ok" 或 "error"
-        deleted_count: int   — 实际删除的文档块数量
-    """
     try:
         from super_agent.knowledge.stores import get_store
 
@@ -513,22 +391,35 @@ async def rag_delete(req: DeleteRequest):
         return DeleteResponse(status="error", deleted_count=0)
 
 
+@app.post("/rag/clear")
+def rag_clear(tenant_id: str = "", department: str = ""):
+    """清空指定租户/部门的向量集合和 ES 索引；不传则清空公共库。"""
+    effective_tenant = department or tenant_id
+    label = effective_tenant or "public"
+    logger.info("POST /rag/clear tenant=%s", label)
+
+    from super_agent.knowledge.stores import get_store
+
+    # 清空向量库
+    store = get_store(tenant_id=effective_tenant)
+    store.clear()
+
+    # 清空 ES 索引
+    if settings.rag.enable_bm25_hybrid:
+        try:
+            from super_agent.knowledge.es_client import ESClient
+            es = ESClient(tenant_id=effective_tenant)
+            es.ensure_index()
+            es.clear()
+        except Exception as e:
+            logger.warning("ES clear failed (non-blocking): %s", e)
+
+    return {"status": "ok", "tenant": label}
+
+
 @app.post("/rag/doc/status")
-async def rag_doc_status(doc_path: str, tenant_id: str = ""):
+def rag_doc_status(doc_path: str, tenant_id: str = ""):
     logger.info("POST /rag/doc/status doc_path=%s tenant_id=%s", doc_path, tenant_id)
-    """查询指定文档的索引状态（版本、哈希、最近索引时间）。
-
-    参数:
-        doc_path: str          — 文档文件路径（与索引时一致）
-        tenant_id: str (默认 "") — 租户标识
-
-    返回:
-        status: str        — "found" 或 "not_found"
-        file_path: str     — 文档路径（仅 found 时返回）
-        version: str       — 文档版本号（仅 found 时返回）
-        file_hash: str     — MD5 文件哈希（仅 found 时返回）
-        last_indexed: str  — 最近索引时间 ISO 格式（仅 found 时返回）
-    """
     from super_agent.knowledge.stores import get_store
     from super_agent.knowledge.embedders import get_embedder
     from super_agent.knowledge.chunkers import SemanticChunker
@@ -544,16 +435,8 @@ async def rag_doc_status(doc_path: str, tenant_id: str = ""):
 
 
 @app.post("/rag/doc/list")
-async def rag_doc_list(tenant_id: str = ""):
+def rag_doc_list(tenant_id: str = ""):
     logger.info("POST /rag/doc/list tenant_id=%s", tenant_id)
-    """列出指定租户下所有已索引的文档及其版本信息。
-
-    参数:
-        tenant_id: str (默认 "") — 租户标识
-
-    返回:
-        documents: list[dict] — 文档列表，每项含 file_path / version / last_indexed
-    """
     from super_agent.knowledge.stores import get_store
     from super_agent.knowledge.embedders import get_embedder
     from super_agent.knowledge.chunkers import SemanticChunker
@@ -563,6 +446,13 @@ async def rag_doc_list(tenant_id: str = ""):
     chunker = SemanticChunker()
     indexer = Indexer(store=store, embedder=embedder, chunker=chunker, tenant_id=tenant_id)
     return {"documents": indexer.list_documents()}
+
+
+@app.get("/rag/collections")
+def rag_collections():
+    logger.info("GET /rag/collections")
+    from super_agent.knowledge.stores import list_collections
+    return {"collections": list_collections()}
 
 
 # 静态文件（前端聊天界面），放在所有 API 路由之后以免拦截请求

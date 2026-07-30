@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import chromadb
+
 from super_agent.config import settings
 from super_agent.knowledge.models import Chunk, SearchResult
 from super_agent.knowledge.stores.base import BaseVectorStore
@@ -17,6 +18,10 @@ class ChromaStore(BaseVectorStore):
             name=col_name,
             metadata={"hnsw:space": "cosine"},
         )
+
+    @property
+    def collection_name(self) -> str:
+        return self.collection.name
 
     def add(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
         if not chunks:
@@ -69,9 +74,7 @@ class ChromaStore(BaseVectorStore):
     def _build_where(self, filters: dict) -> dict:
         where = {}
         for key, value in filters.items():
-            if key == "topic_tags" and isinstance(value, dict) and "$contains" in value:
-                where[key] = value
-            elif isinstance(value, dict):
+            if key == "topic_tags" and isinstance(value, dict) and "$contains" in value or isinstance(value, dict):
                 where[key] = value
             else:
                 where[key] = {"$eq": value}

@@ -1,0 +1,2018 @@
+package run
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-resty/resty/v2"
+	"github.com/spf13/cobra"
+
+	"github.com/avivsinai/jenkins-cli/internal/filter"
+	"github.com/avivsinai/jenkins-cli/internal/fuzzy"
+	"github.com/avivsinai/jenkins-cli/internal/jenkins"
+	jklog "github.com/avivsinai/jenkins-cli/internal/log"
+	"github.com/avivsinai/jenkins-cli/pkg/cmd/shared"
+	"github.com/avivsinai/jenkins-cli/pkg/cmdutil"
+)
+
+type runListResponse struct {
+	Builds []runSummary `json:"builds"`
+}
+
+type runSummary struct {
+	Number            int64            `json:"number"`
+	Result            string           `json:"result"`
+	Building          bool             `json:"building"`
+	Timestamp         int64            `json:"timestamp"`
+	Duration          int64            `json:"duration"`
+	EstimatedDuration int64            `json:"estimatedDuration"`
+	URL               string           `json:"url"`
+	QueueID           int64            `json:"queueId"`
+	Actions           []map[string]any `json:"actions"`
+	ChangeSet         changeSet        `json:"changeSet"`
+	Artifacts         []artifactItem   `json:"artifacts"`
+}
+
+type runDetail struct {
+	Number            int64             `json:"number"`
+	Result            string            `json:"result"`
+	Building          bool              `json:"building"`
+	Timestamp         int64             `json:"timestamp"`
+	Duration          int64             `json:"duration"`
+	EstimatedDuration int64             `json:"estimatedDuration"`
+	URL               string            `json:"url"`
+	Actions           []map[string]any  `json:"actions"`
+	Parameters        []map[string]any  `json:"parameters"`
+	Stages            []map[string]any  `json:"stages"`
+	ChangeSet         changeSet         `json:"changeSet"`
+	Artifacts         []artifactItem    `json:"artifacts"`
+	QueueID           int64             `json:"queueId"`
+	BuiltOn           string            `json:"builtOn"`
+	Executor          *executorMetadata `json:"executor"`
+	FullDisplayName   string            `json:"fullDisplayName"`
+	Description       string            `json:"description"`
+}
+
+type artifactItem struct {
+	FileName     string `json:"fileName"`
+	RelativePath string `json:"relativePath"`
+	Size         int64  `json:"size"`
+}
+
+type changeSet struct {
+	Items []changeSetItem `json:"items"`
+}
+
+type changeSetItem struct {
+	AuthorEmail string          `json:"authorEmail"`
+	CommitID    string          `json:"commitId"`
+	Msg         string          `json:"msg"`
+	Author      changeSetAuthor `json:"author"`
+}
+
+type changeSetAuthor struct {
+	FullName string `json:"fullName"`
+}
+
+type executorMetadata struct {
+	Number int `json:"number"`
+}
+
+type queueItemStatus struct {
+	ID           int64            `json:"id"`
+	Why          string           `json:"why"`
+	Cancelled    bool             `json:"cancelled"`
+	InQueueSince int64            `json:"inQueueSince"`
+	Executable   *queueExecutable `json:"executable"`
+}
+
+type queueExecutable struct {
+	Number int64 `json:"number"`
+}
+
+type runListOptions struct {
+	Limit         int
+	Cursor        string
+	Filters       []filter.Filter
+	Since         *time.Time
+	SelectFields  []string
+	GroupBy       string
+	Aggregation   string
+	WithMeta      bool
+	AllowRegex    bool
+	IncludeQueued bool
+}
+
+type runInspection struct {
+	Summary    runSummary
+	Context    filter.Context
+	Parameters map[string]string
+	Causes     []runCauseInfo
+	Artifacts  []artifactItem
+}
+
+type runCauseInfo struct {
+	Type     string
+	UserID   string
+	UserName string
+}
+
+type runGroupAccumulator struct {
+	Value          string
+	Count          int
+	Last           *runInspection
+	First          *runInspection
+	LastTimestamp  int64
+	FirstTimestamp int64
+}
+
+const runListHeadroom = 50
+
+type selectionRequirement struct {
+	requiresParameters bool
+	requiresArtifacts  bool
+	requiresCauses     bool
+}
+
+var selectFieldRegistry = map[string]selectionRequirement{
+	"number":              {},
+	"status":              {},
+	"result":              {},
+	"starttime":           {},
+	"durationms":          {},
+	"branch":              {},
+	"commit":              {},
+	"url":                 {},
+	"queueid":             {},
+	"parameters":          {requiresParameters: true},
+	"artifacts":           {requiresArtifacts: true},
+	"causes":              {requiresCauses: true},
+	"estimateddurationms": {},
+}
+
+type metadataCollector struct {
+	enabled    bool
+	parameters map[string]*parameterStat
+	totalRuns  int
+}
+
+type parameterStat struct {
+	Count   int
+	Secret  bool
+	Samples map[string]struct{}
+}
+
+func newMetadataCollector(enabled bool) *metadataCollector {
+	return &metadataCollector{
+		enabled:    enabled,
+		parameters: make(map[string]*parameterStat),
+	}
+}
+
+func (m *metadataCollector) observe(run *runInspection) {
+	if !m.enabled || run == nil {
+		return
+	}
+
+	m.totalRuns++
+	for name, value := range run.Parameters {
+		stat, ok := m.parameters[name]
+		if !ok {
+			stat = &parameterStat{
+				Secret:  filter.IsLikelySecret(name),
+				Samples: make(map[string]struct{}),
+			}
+			m.parameters[name] = stat
+		}
+		stat.Count++
+		if stat.Secret {
+			continue
+		}
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if len(stat.Samples) < 5 {
+			stat.Samples[value] = struct{}{}
+		}
+	}
+}
+
+func selectionRequiresParameters(fields []string) bool {
+	for _, field := range fields {
+		if spec, ok := selectFieldRegistry[field]; ok && spec.requiresParameters {
+			return true
+		}
+	}
+	return false
+}
+
+func selectionRequiresArtifacts(fields []string) bool {
+	for _, field := range fields {
+		if spec, ok := selectFieldRegistry[field]; ok && spec.requiresArtifacts {
+			return true
+		}
+	}
+	return false
+}
+
+func selectionRequiresCauses(fields []string) bool {
+	for _, field := range fields {
+		if spec, ok := selectFieldRegistry[field]; ok && spec.requiresCauses {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSince(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, errors.New("since value cannot be empty")
+	}
+
+	if ts, err := time.Parse(time.RFC3339, value); err == nil {
+		return ts, nil
+	}
+
+	dur, err := filter.ParseDuration(value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid since value %q: %w", value, err)
+	}
+	return time.Now().Add(-dur), nil
+}
+
+func parseSelectFields(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(value, ",")
+	seen := make(map[string]struct{})
+	fields := make([]string, 0, len(parts))
+	for _, part := range parts {
+		field := strings.ToLower(strings.TrimSpace(part))
+		if field == "" {
+			continue
+		}
+		if _, ok := selectFieldRegistry[field]; !ok {
+			return nil, fmt.Errorf("unsupported select field %q", part)
+		}
+		if _, ok := seen[field]; ok {
+			continue
+		}
+		seen[field] = struct{}{}
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	return fields, nil
+}
+
+func normalizeAggregation(value string) (string, error) {
+	trimmed := strings.TrimSpace(strings.ToLower(value))
+	if trimmed == "" {
+		return "count", nil
+	}
+	switch trimmed {
+	case "count", "first", "last":
+		return trimmed, nil
+	default:
+		return "", fmt.Errorf("unsupported aggregation %q", value)
+	}
+}
+
+func NewCmdRun(f *cmdutil.Factory) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "run",
+		Short: "Interact with job runs",
+	}
+
+	cmd.AddCommand(
+		newRunStartCmd(f),
+		newRunListCmd(f),
+		NewCmdRunSearch(f),
+		newRunParamsCmd(f),
+		newRunViewCmd(f),
+		newRunCancelCmd(f),
+		newRunRerunCmd(f),
+	)
+
+	return cmd
+}
+
+func newRunStartCmd(f *cmdutil.Factory) *cobra.Command {
+	var params []string
+	var follow bool
+	var interval time.Duration
+	var fuzzyMatch bool
+	var noInteractive bool
+	var resultOnly bool
+	var waitEnabled bool
+	var waitInterval time.Duration
+	var waitTimeout time.Duration
+
+	cmd := &cobra.Command{
+		Use:   "start <jobPath>",
+		Short: "Trigger a job run",
+		Long: `Trigger a job run. If the job is not found, will automatically search for similar jobs.
+
+Related commands:
+  jk search --job-glob '<pattern>'      Search for jobs by pattern
+  jk job ls --folder '<folder>'         List jobs in a folder`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Validate --result requires --follow
+			if resultOnly && !follow {
+				return fmt.Errorf("--result requires --follow flag")
+			}
+			// Validate --wait and --follow are mutually exclusive
+			if waitEnabled && follow {
+				return fmt.Errorf("--wait and --follow are mutually exclusive")
+			}
+
+			client, err := shared.JenkinsClient(cmd, f)
+			if err != nil {
+				return err
+			}
+
+			paramMap := make(map[string]string, len(params))
+			for _, p := range params {
+				parts := strings.SplitN(p, "=", 2)
+				if len(parts) != 2 {
+					return fmt.Errorf("invalid parameter %q", p)
+				}
+				paramMap[strings.TrimSpace(parts[0])] = parts[1]
+			}
+
+			// Try to resolve the job path (with fuzzy matching if enabled)
+			resolvedPath, err := resolveJobPath(cmd, client, args[0], fuzzyMatch, !noInteractive)
+			if err != nil {
+				return err
+			}
+
+			// Validate job is buildable before attempting to trigger
+			if err := validateJobIsBuildable(client, resolvedPath); err != nil {
+				return err
+			}
+
+			resp, err := triggerBuild(client, resolvedPath, paramMap)
+			if err != nil {
+				return err
+			}
+
+			if !shared.WantsJSON(cmd) && !shared.WantsYAML(cmd) && !resultOnly && !shared.WantsQuiet(cmd) {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Triggered run for %s\n", resolvedPath)
+			}
+
+			// Handle --wait flag (mutually exclusive with --follow)
+			if waitEnabled {
+				queueLocation := queueLocationFromResponse(resp)
+				buildNumber, err := waitForBuildNumber(client, queueLocation, 5*time.Minute)
+				if err != nil {
+					return err
+				}
+
+				ctx := cmd.Context()
+				if ctx == nil {
+					ctx = context.Background()
+				}
+
+				result, err := waitForCompletion(ctx, client, resolvedPath, buildNumber, waitInterval, waitTimeout)
+				if err != nil {
+					return err
+				}
+
+				// Fetch full details for JSON/YAML/human output
+				detail, err := fetchRunDetail(client, resolvedPath, buildNumber)
+				if err != nil {
+					return err
+				}
+				testReport, _ := shared.FetchTestReport(client, resolvedPath, buildNumber)
+				output := buildRunDetailOutput(resolvedPath, *detail, testReport)
+
+				if err := shared.PrintOutput(cmd, output, func() error {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Build #%d completed: %s\n", buildNumber, result)
+					return nil
+				}); err != nil {
+					return err
+				}
+
+				// --wait always returns exit codes
+				code := exitCodeForResult(result)
+				if code != 0 {
+					return shared.NewExitError(code, "")
+				}
+				return nil
+			}
+
+			if !follow {
+				if shared.WantsJSON(cmd) || shared.WantsYAML(cmd) {
+					payload := runTriggerOutput{
+						JobPath:       resolvedPath,
+						Message:       "run requested",
+						QueueLocation: queueLocationFromResponse(resp),
+					}
+					return shared.PrintOutput(cmd, payload, func() error {
+						_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Triggered run for %s\n", resolvedPath)
+						return nil
+					})
+				}
+				// In quiet mode, output just the build number.
+				// NOTE: This intentionally blocks waiting for the build number (up to 5 minutes)
+				// because the primary use case for quiet mode is scripting, where the caller
+				// needs the build number to track/poll the build status. Without blocking,
+				// we could only return the queue item URL which is less useful.
+				if shared.WantsQuiet(cmd) {
+					queueLocation := queueLocationFromResponse(resp)
+					buildNumber, err := waitForBuildNumber(client, queueLocation, 5*time.Minute)
+					if err != nil {
+						return err
+					}
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), buildNumber)
+					return nil
+				}
+				return nil
+			}
+
+			return followTriggeredRun(cmd, client, resolvedPath, resp, interval, resultOnly)
+		},
+	}
+
+	cmd.Flags().StringArrayVarP(&params, "param", "p", nil, "Build parameter key=value (use multiple -p flags for multiple params)")
+	cmd.Flags().BoolVar(&follow, "follow", false, "Follow the run progress until completion")
+	cmd.Flags().DurationVar(&interval, "follow-interval", 500*time.Millisecond, "Polling interval when following runs")
+	cmd.Flags().BoolVar(&fuzzyMatch, "fuzzy", false, "Enable fuzzy matching for job names")
+	cmd.Flags().BoolVar(&noInteractive, "non-interactive", false, "Disable interactive selection (fail on ambiguous matches)")
+	cmd.Flags().BoolVar(&resultOnly, "result", false, "Output only the final build result (requires --follow)")
+	cmd.Flags().BoolVar(&waitEnabled, "wait", false, "Wait for build to complete (no log streaming)")
+	cmd.Flags().DurationVar(&waitInterval, "interval", 2*time.Second, "Polling interval when waiting")
+	cmd.Flags().DurationVar(&waitTimeout, "timeout", 0, "Maximum time to wait (0 = no timeout)")
+	return cmd
+}
+
+func newRunListCmd(f *cmdutil.Factory) *cobra.Command {
+	var (
+		limit         int
+		cursor        string
+		filterArgs    []string
+		sinceArg      string
+		selectArg     string
+		groupBy       string
+		aggregation   string
+		withMeta      bool
+		enableRegex   bool
+		includeQueued bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "ls <jobPath>",
+		Short: "List recent runs",
+		Example: `  # List recent runs for a job
+	jk run ls Helm.Chart.Deploy
+
+	# Filter by parameter values
+	jk run ls Helm.Chart.Deploy --filter param.CHART_NAME~nova --filter result=SUCCESS --since 7d
+
+	# Group by chart name and return the last run per chart
+	jk run ls Helm.Chart.Deploy --group-by param.CHART_NAME --agg last --json
+
+	# Select specific fields for agent consumption
+	jk run ls Helm.Chart.Deploy --select parameters --limit 5 --json --with-meta`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := shared.JenkinsClient(cmd, f)
+			if err != nil {
+				return err
+			}
+
+			parsedFilters, err := filter.Parse(filterArgs)
+			if err != nil {
+				return err
+			}
+
+			var since *time.Time
+			if strings.TrimSpace(sinceArg) != "" {
+				sinceValue, err := parseSince(sinceArg)
+				if err != nil {
+					return err
+				}
+				since = &sinceValue
+			}
+
+			selectFields, err := parseSelectFields(selectArg)
+			if err != nil {
+				return err
+			}
+
+			agg, err := normalizeAggregation(aggregation)
+			if err != nil {
+				return err
+			}
+			if groupBy == "" && agg != "" && agg != "count" {
+				return errors.New("aggregation flag requires --group-by")
+			}
+
+			opts := runListOptions{
+				Limit:         limit,
+				Cursor:        cursor,
+				Filters:       parsedFilters,
+				Since:         since,
+				SelectFields:  selectFields,
+				GroupBy:       groupBy,
+				Aggregation:   agg,
+				WithMeta:      withMeta,
+				AllowRegex:    enableRegex,
+				IncludeQueued: includeQueued,
+			}
+
+			output, err := executeRunList(cmd.Context(), client, args[0], opts)
+			if err != nil {
+				return err
+			}
+
+			return shared.PrintOutput(cmd, output, func() error {
+				return renderRunListHuman(cmd, output, opts)
+			})
+		},
+	}
+
+	cmd.Flags().IntVar(&limit, "limit", 20, "Number of runs to list")
+	cmd.Flags().StringVar(&cursor, "cursor", "", "Cursor for pagination (use value from previous output)")
+	cmd.Flags().StringSliceVar(&filterArgs, "filter", nil, "Filter runs (repeatable): key[op]value")
+	cmd.Flags().StringVar(&sinceArg, "since", "", "Filter runs since timestamp or duration (RFC3339, 72h, 7d)")
+	cmd.Flags().StringVar(&selectArg, "select", "", "Select additional fields (comma-separated)")
+	cmd.Flags().StringVar(&groupBy, "group-by", "", "Group results by field (e.g., param.CHART_NAME)")
+	cmd.Flags().StringVar(&aggregation, "agg", "count", "Aggregation function for grouped results: count, first, last")
+	cmd.Flags().BoolVar(&withMeta, "with-meta", false, "Include metadata in JSON output")
+	cmd.Flags().BoolVar(&enableRegex, "regex", false, "Enable regular expression matching for filters")
+	cmd.Flags().BoolVar(&includeQueued, "include-queued", false, "Include queued (not yet started) builds in output")
+
+	return cmd
+}
+
+func executeRunList(ctx context.Context, client *jenkins.Client, jobPath string, opts runListOptions) (runListOutput, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 20
+	}
+	if opts.Aggregation == "" {
+		opts.Aggregation = "count"
+	}
+
+	requireArtifacts := filter.RequiresArtifacts(opts.Filters) || selectionRequiresArtifacts(opts.SelectFields) || strings.HasPrefix(opts.GroupBy, "artifact.")
+	requireParams := filter.RequiresParameters(opts.Filters) || selectionRequiresParameters(opts.SelectFields) || strings.HasPrefix(opts.GroupBy, "param.") || opts.WithMeta
+	requireCauses := filter.RequiresCauses(opts.Filters) || selectionRequiresCauses(opts.SelectFields) || strings.HasPrefix(opts.GroupBy, "cause.")
+
+	fetchLimit := opts.Limit + runListHeadroom
+	if fetchLimit < opts.Limit {
+		fetchLimit = opts.Limit
+	}
+
+	path := fmt.Sprintf("/%s/api/json", jenkins.EncodeJobPath(jobPath))
+	query := buildRunListTree(fetchLimit, requireArtifacts, requireParams, requireCauses)
+	req := client.NewRequest().SetQueryParam("tree", query)
+	if ctx != nil {
+		req.SetContext(ctx)
+	}
+
+	var resp runListResponse
+	if _, err := client.Do(req, http.MethodGet, path, &resp); err != nil {
+		return runListOutput{}, err
+	}
+
+	out, _, err := processRunList(jobPath, opts, resp.Builds, requireArtifacts, requireParams, requireCauses)
+	if err != nil {
+		return out, err
+	}
+
+	// Prepend queued items if requested
+	if opts.IncludeQueued {
+		queuedItems, qErr := fetchQueuedItemsForJob(ctx, client, jobPath)
+		if qErr != nil {
+			jklog.L().Debug().Err(qErr).Msg("failed to fetch queued items")
+		} else if len(queuedItems) > 0 {
+			originalBuilds := out.Items
+			out.Items = append(queuedItems, out.Items...)
+
+			// Re-apply limit to combined list (queued items + builds)
+			if len(out.Items) > opts.Limit {
+				out.Items = out.Items[:opts.Limit]
+
+				// Recompute cursor based on what's actually returned.
+				// Find the last build (Number > 0) in the truncated output.
+				var lastBuildInOutput int64
+				for i := len(out.Items) - 1; i >= 0; i-- {
+					if out.Items[i].Number > 0 {
+						lastBuildInOutput = out.Items[i].Number
+						break
+					}
+				}
+
+				if lastBuildInOutput > 0 {
+					// Some builds are in output; cursor points to last one
+					out.NextCursor = encodeRunCursor(normalizeJobPath(jobPath), lastBuildInOutput)
+				} else if len(originalBuilds) > 0 {
+					// All builds were pushed out by queued items; cursor uses first build + 1
+					// because cursor semantics are exclusive (skips Number >= cutoff)
+					out.NextCursor = encodeRunCursor(normalizeJobPath(jobPath), originalBuilds[0].Number+1)
+				}
+			}
+		}
+	}
+
+	return out, err
+}
+
+// queueListResponse matches the Jenkins queue API response structure
+type queueListResponse struct {
+	Items []queueListItem `json:"items"`
+}
+
+type queueListItem struct {
+	ID           int64        `json:"id"`
+	Why          string       `json:"why"`
+	InQueueSince int64        `json:"inQueueSince"`
+	Task         queueTaskRef `json:"task"`
+}
+
+type queueTaskRef struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+// fetchQueuedItemsForJob fetches queue items matching the given job path
+func fetchQueuedItemsForJob(ctx context.Context, client *jenkins.Client, jobPath string) ([]runListItem, error) {
+	req := client.NewRequest().SetQueryParam("tree", "items[id,task[name,url],why,inQueueSince]")
+	if ctx != nil {
+		req.SetContext(ctx)
+	}
+
+	var resp queueListResponse
+	if _, err := client.Do(req, http.MethodGet, "/queue/api/json", &resp); err != nil {
+		return nil, err
+	}
+
+	normalized := normalizeJobPath(jobPath)
+	var items []runListItem
+
+	for _, qItem := range resp.Items {
+		// Match job by checking if the task URL contains the job path
+		taskPath := extractJobPathFromURL(qItem.Task.URL)
+		if normalizeJobPath(taskPath) != normalized {
+			continue
+		}
+
+		item := runListItem{
+			ID:        fmt.Sprintf("%s/q%d", normalized, qItem.ID),
+			Number:    0, // Queued items don't have a build number yet
+			Status:    "queued",
+			QueueID:   qItem.ID,
+			StartTime: formatTimestamp(qItem.InQueueSince),
+			Fields: map[string]any{
+				"queueReason": qItem.Why,
+			},
+		}
+		items = append(items, item)
+	}
+
+	return items, nil
+}
+
+// extractJobPathFromURL extracts the job path from a Jenkins job URL.
+// It handles URL-encoded segments (e.g., spaces as %20, slashes in branch names).
+func extractJobPathFromURL(rawURL string) string {
+	// URL format: http://jenkins/job/Folder/job/SubFolder/job/JobName/
+	// We need to extract: Folder/SubFolder/JobName
+	parts := strings.Split(rawURL, "/job/")
+	if len(parts) < 2 {
+		return ""
+	}
+	var pathParts []string
+	for _, part := range parts[1:] {
+		cleaned := strings.TrimSuffix(strings.TrimSuffix(part, "/"), "/")
+		if cleaned != "" {
+			// Decode URL-encoded characters (e.g., %20 -> space, %2F -> /)
+			if decoded, err := url.PathUnescape(cleaned); err == nil {
+				cleaned = decoded
+			}
+			pathParts = append(pathParts, cleaned)
+		}
+	}
+	return strings.Join(pathParts, "/")
+}
+
+func buildRunListTree(fetchLimit int, includeArtifacts, includeParameters, includeCauses bool) string {
+	actionsFields := []string{
+		"lastBuiltRevision[SHA1,branch[name]]",
+		"buildsByBranchName[*]",
+		"remoteUrls",
+	}
+	if includeParameters {
+		actionsFields = append(actionsFields, "parameters[name,value]")
+	}
+	if includeCauses {
+		actionsFields = append(actionsFields, "causes[shortDescription,userId,userName,_class]")
+	}
+
+	fields := []string{
+		"number",
+		"url",
+		"result",
+		"building",
+		"timestamp",
+		"duration",
+		"estimatedDuration",
+		"queueId",
+		fmt.Sprintf("actions[%s]", strings.Join(actionsFields, ",")),
+		"changeSet[items[authorEmail,author[fullName],commitId,msg]]",
+	}
+	if includeArtifacts {
+		fields = append(fields, "artifacts[fileName,relativePath,size]")
+	}
+
+	return fmt.Sprintf("builds[%s]{,%d}", strings.Join(fields, ","), fetchLimit)
+}
+
+func processRunList(jobPath string, opts runListOptions, builds []runSummary, needArtifacts, needParams, needCauses bool) (runListOutput, []*runInspection, error) {
+	normalized := normalizeJobPath(jobPath)
+	sorted := make([]runSummary, len(builds))
+	copy(sorted, builds)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Number > sorted[j].Number
+	})
+
+	var cutoff int64
+	if strings.TrimSpace(opts.Cursor) != "" {
+		payload, err := decodeRunCursor(opts.Cursor)
+		if err != nil {
+			return runListOutput{}, nil, err
+		}
+		if payload.JobPath != "" && payload.JobPath != normalized {
+			return runListOutput{}, nil, fmt.Errorf("cursor job path %q does not match %q", payload.JobPath, normalized)
+		}
+		cutoff = payload.Number
+	}
+
+	var sinceMs int64
+	if opts.Since != nil {
+		sinceMs = opts.Since.UnixMilli()
+	}
+
+	evalOpts := []filter.Option{}
+	if opts.AllowRegex {
+		evalOpts = append(evalOpts, filter.WithRegexMatching())
+	}
+
+	collector := newMetadataCollector(opts.WithMeta)
+	matched := make([]*runInspection, 0, minInt(opts.Limit, len(sorted)))
+	groups := make(map[string]*runGroupAccumulator)
+	moreMatches := false
+
+	for _, summary := range sorted {
+		if cutoff > 0 && summary.Number >= cutoff {
+			continue
+		}
+		if sinceMs > 0 && summary.Timestamp < sinceMs {
+			break
+		}
+
+		inspection := inspectRun(summary, needParams, needCauses, needArtifacts)
+		if inspection == nil {
+			continue
+		}
+
+		if len(opts.Filters) > 0 && !filter.Evaluate(inspection.Context, opts.Filters, evalOpts...) {
+			continue
+		}
+
+		collector.observe(inspection)
+
+		if opts.GroupBy != "" {
+			groupValue := resolveGroupValue(inspection, opts.GroupBy)
+			acc, ok := groups[groupValue]
+			if !ok {
+				acc = &runGroupAccumulator{Value: groupValue}
+				groups[groupValue] = acc
+			}
+			acc.Count++
+			if acc.Last == nil || summary.Timestamp > acc.LastTimestamp {
+				acc.Last = inspection
+				acc.LastTimestamp = summary.Timestamp
+			}
+			if acc.First == nil || summary.Timestamp < acc.FirstTimestamp {
+				acc.First = inspection
+				acc.FirstTimestamp = summary.Timestamp
+			}
+		}
+
+		if len(matched) < opts.Limit {
+			matched = append(matched, inspection)
+		} else {
+			moreMatches = true
+		}
+	}
+
+	nextCursor := ""
+	if moreMatches && len(matched) > 0 {
+		nextCursor = encodeRunCursor(normalized, matched[len(matched)-1].Summary.Number)
+	}
+
+	return assembleRunListOutput(jobPath, opts, matched, groups, collector, nextCursor), matched, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func inspectRun(summary runSummary, needParams, needCauses, needArtifacts bool) *runInspection {
+	ctx := filter.Context{
+		"result":            strings.ToUpper(strings.TrimSpace(summary.Result)),
+		"status":            statusFromFlags(summary.Building),
+		"queue.id":          summary.QueueID,
+		"building":          summary.Building,
+		"started":           time.UnixMilli(summary.Timestamp),
+		"duration":          time.Duration(summary.Duration) * time.Millisecond,
+		"estimatedDuration": time.Duration(summary.EstimatedDuration) * time.Millisecond,
+	}
+
+	if ctx["result"] == "" {
+		ctx["result"] = ctx["status"]
+	}
+
+	parameters := make(map[string]string)
+	if needParams {
+		parameters = extractParametersFromSummary(summary)
+		for name, value := range parameters {
+			ctx["param."+name] = value
+		}
+	}
+
+	var causes []runCauseInfo
+	if needCauses {
+		causes = extractCausesFromSummary(summary)
+		var causeUsers []string
+		var causeTypes []string
+		for _, cause := range causes {
+			if cause.UserName != "" {
+				causeUsers = append(causeUsers, cause.UserName)
+			} else if cause.UserID != "" {
+				causeUsers = append(causeUsers, cause.UserID)
+			}
+			if cause.Type != "" {
+				causeTypes = append(causeTypes, cause.Type)
+			}
+		}
+		if len(causeUsers) > 0 {
+			ctx["cause.user"] = causeUsers
+		}
+		if len(causeTypes) > 0 {
+			ctx["cause.type"] = causeTypes
+		}
+	}
+
+	if needArtifacts {
+		var names []string
+		var paths []string
+		for _, artifact := range summary.Artifacts {
+			if artifact.FileName != "" {
+				names = append(names, artifact.FileName)
+			}
+			if artifact.RelativePath != "" {
+				paths = append(paths, artifact.RelativePath)
+			}
+		}
+		if len(names) > 0 {
+			ctx["artifact.name"] = names
+		}
+		if len(paths) > 0 {
+			ctx["artifact.path"] = paths
+		}
+	}
+
+	if scm := extractSCMInfo(summary.Actions, summary.ChangeSet); scm != nil {
+		if scm.Branch != "" {
+			ctx["branch"] = scm.Branch
+		}
+		if scm.Commit != "" {
+			ctx["commit"] = scm.Commit
+		}
+	}
+
+	return &runInspection{
+		Summary:    summary,
+		Context:    ctx,
+		Parameters: parameters,
+		Causes:     causes,
+		Artifacts:  summary.Artifacts,
+	}
+}
+
+func extractParametersFromSummary(summary runSummary) map[string]string {
+	params := make(map[string]string)
+	for _, action := range summary.Actions {
+		raw, ok := action["parameters"].([]any)
+		if !ok {
+			continue
+		}
+		for _, entry := range raw {
+			if paramMap, ok := entry.(map[string]any); ok {
+				name, _ := paramMap["name"].(string)
+				if strings.TrimSpace(name) == "" {
+					continue
+				}
+				value := fmt.Sprint(paramMap["value"])
+				params[strings.TrimSpace(name)] = value
+			}
+		}
+	}
+	return params
+}
+
+func extractCausesFromSummary(summary runSummary) []runCauseInfo {
+	var causes []runCauseInfo
+	for _, action := range summary.Actions {
+		raw, ok := action["causes"].([]any)
+		if !ok {
+			continue
+		}
+		for _, entry := range raw {
+			if causeMap, ok := entry.(map[string]any); ok {
+				cause := runCauseInfo{}
+				if className, ok := causeMap["_class"].(string); ok && className != "" {
+					cause.Type = className
+				} else if desc, ok := causeMap["shortDescription"].(string); ok {
+					cause.Type = desc
+				}
+				if userID, ok := causeMap["userId"].(string); ok {
+					cause.UserID = userID
+				}
+				if userName, ok := causeMap["userName"].(string); ok {
+					cause.UserName = userName
+				}
+				causes = append(causes, cause)
+			}
+		}
+	}
+	return causes
+}
+
+func resolveGroupValue(run *runInspection, key string) string {
+	if run == nil {
+		return ""
+	}
+	if value, ok := run.Context[key]; ok {
+		return contextValueToString(value)
+	}
+	if strings.HasPrefix(key, "param.") {
+		name := strings.TrimPrefix(key, "param.")
+		if val, ok := run.Parameters[name]; ok {
+			return val
+		}
+	}
+	return ""
+}
+
+func contextValueToString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []string:
+		if len(v) > 0 {
+			return v[0]
+		}
+	case []any:
+		for _, entry := range v {
+			if s := contextValueToString(entry); s != "" {
+				return s
+			}
+		}
+	case time.Time:
+		return v.Format(time.RFC3339)
+	case time.Duration:
+		return v.String()
+	case fmt.Stringer:
+		return v.String()
+	case bool:
+		return strconv.FormatBool(v)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return fmt.Sprint(v)
+	}
+	return ""
+}
+
+func availableSelectFields() []string {
+	fields := make([]string, 0, len(selectFieldRegistry))
+	for field := range selectFieldRegistry {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func (m *metadataCollector) metadata(jobPath string, opts runListOptions) *runListMetadata {
+	meta := &runListMetadata{
+		Filters: &filterMetadata{
+			Available: filter.AllowedKeys(),
+			Operators: filter.Operators(),
+		},
+		Fields:    availableSelectFields(),
+		Selection: append([]string{}, opts.SelectFields...),
+	}
+	if opts.Since != nil {
+		meta.Since = opts.Since.Format(time.RFC3339)
+	}
+	if opts.GroupBy != "" {
+		meta.GroupBy = opts.GroupBy
+		meta.Aggregation = opts.Aggregation
+	}
+
+	if !m.enabled || m.totalRuns == 0 {
+		meta.Suggestions = buildMetadataSuggestions(jobPath, opts)
+		return meta
+	}
+
+	params := make([]runParameterInfo, 0, len(m.parameters))
+	for name, stat := range m.parameters {
+		info := runParameterInfo{
+			Name:     name,
+			IsSecret: stat.Secret,
+		}
+		if m.totalRuns > 0 {
+			info.Frequency = float64(stat.Count) / float64(m.totalRuns)
+		}
+		if !stat.Secret && len(stat.Samples) > 0 {
+			samples := make([]string, 0, len(stat.Samples))
+			for sample := range stat.Samples {
+				samples = append(samples, sample)
+			}
+			sort.Strings(samples)
+			if len(samples) > 5 {
+				samples = samples[:5]
+			}
+			info.SampleValues = samples
+		}
+		params = append(params, info)
+	}
+	sort.Slice(params, func(i, j int) bool {
+		return strings.ToLower(params[i].Name) < strings.ToLower(params[j].Name)
+	})
+
+	meta.Parameters = params
+	meta.Suggestions = buildMetadataSuggestions(jobPath, opts)
+	return meta
+}
+
+func buildMetadataSuggestions(jobPath string, opts runListOptions) []string {
+	normalized := normalizeJobPath(jobPath)
+	suggestions := make([]string, 0, 3)
+
+	if len(opts.Filters) == 0 {
+		suggestions = append(suggestions, fmt.Sprintf("jk run ls %s --filter result=SUCCESS --limit 5", normalized))
+	}
+	if opts.GroupBy == "" {
+		suggestions = append(suggestions, fmt.Sprintf("jk run ls %s --group-by result --agg last", normalized))
+	}
+	if !selectionRequiresParameters(opts.SelectFields) {
+		suggestions = append(suggestions, fmt.Sprintf("jk run ls %s --filter param.NAME~=value", normalized))
+	}
+
+	if len(suggestions) > 3 {
+		return suggestions[:3]
+	}
+	return suggestions
+}
+
+func renderRunListHuman(cmd *cobra.Command, output runListOutput, opts runListOptions) error {
+	w := cmd.OutOrStdout()
+
+	if len(output.Items) == 0 && len(output.Groups) == 0 {
+		_, _ = fmt.Fprintln(w, "No runs found")
+		return nil
+	}
+
+	if opts.GroupBy != "" && len(output.Groups) > 0 {
+		_, _ = fmt.Fprintf(w, "Grouped by %s (agg=%s)\n", opts.GroupBy, strings.ToLower(opts.Aggregation))
+		for _, group := range output.Groups {
+			label := group.Value
+			if strings.TrimSpace(label) == "" {
+				label = "(none)"
+			}
+			switch opts.Aggregation {
+			case "count":
+				if group.Last != nil {
+					_, _ = fmt.Fprintf(w, "%s\t%d\t#%d\t%s\t%s\n", label, group.Count, group.Last.Number, strings.ToUpper(group.Last.Result), group.Last.StartTime)
+				} else {
+					_, _ = fmt.Fprintf(w, "%s\t%d\n", label, group.Count)
+				}
+			case "last":
+				if group.Last != nil {
+					_, _ = fmt.Fprintf(w, "%s\t#%d\t%s\t%s\n", label, group.Last.Number, strings.ToUpper(group.Last.Result), group.Last.StartTime)
+				} else {
+					_, _ = fmt.Fprintf(w, "%s\t(no data)\n", label)
+				}
+			case "first":
+				if group.First != nil {
+					_, _ = fmt.Fprintf(w, "%s\t#%d\t%s\t%s\n", label, group.First.Number, strings.ToUpper(group.First.Result), group.First.StartTime)
+				} else {
+					_, _ = fmt.Fprintf(w, "%s\t(no data)\n", label)
+				}
+			default:
+				if group.Last != nil {
+					_, _ = fmt.Fprintf(w, "%s\t#%d\t%s\t%s\n", label, group.Last.Number, strings.ToUpper(group.Last.Result), group.Last.StartTime)
+				} else {
+					_, _ = fmt.Fprintf(w, "%s\t(no data)\n", label)
+				}
+			}
+		}
+	} else {
+		for _, item := range output.Items {
+			// For queued items: show "queued" instead of #0, show status instead of empty result
+			displayNum := fmt.Sprintf("#%d", item.Number)
+			displayStatus := strings.ToUpper(item.Result)
+			if item.Number == 0 && item.Status == "queued" {
+				displayNum = fmt.Sprintf("q%d", item.QueueID)
+				displayStatus = "QUEUED"
+			} else if displayStatus == "" {
+				displayStatus = strings.ToUpper(item.Status)
+			}
+			_, _ = fmt.Fprintf(
+				w,
+				"%s\t%s\t%s\t%s\n",
+				displayNum,
+				displayStatus,
+				item.StartTime,
+				shared.DurationString(item.DurationMs),
+			)
+		}
+	}
+
+	if output.NextCursor != "" {
+		_, _ = fmt.Fprintf(w, "Next cursor: %s\n", output.NextCursor)
+	}
+	return nil
+}
+
+func newRunViewCmd(f *cmdutil.Factory) *cobra.Command {
+	var resultOnly bool
+	var exitStatus bool
+	var waitEnabled bool
+	var waitInterval time.Duration
+	var waitTimeout time.Duration
+	var summaryOnly bool
+
+	cmd := &cobra.Command{
+		Use:   "view <jobPath> <buildNumber>",
+		Short: "View run details",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Validate mutual exclusivity
+			if resultOnly && (shared.WantsJSON(cmd) || shared.WantsYAML(cmd)) {
+				return fmt.Errorf("--result cannot be combined with --json or --yaml")
+			}
+			// Validate --summary cannot be combined with --json or --yaml
+			if summaryOnly && (shared.WantsJSON(cmd) || shared.WantsYAML(cmd)) {
+				return fmt.Errorf("--summary cannot be combined with --json or --yaml")
+			}
+
+			client, err := shared.JenkinsClient(cmd, f)
+			if err != nil {
+				return err
+			}
+
+			num, err := strconv.ParseInt(args[1], 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid build number: %w", err)
+			}
+
+			path := fmt.Sprintf("/%s/%d/api/json", jenkins.EncodeJobPath(args[0]), num)
+			var detail runDetail
+			_, err = client.Do(client.NewRequest(), http.MethodGet, path, &detail)
+			if err != nil {
+				return err
+			}
+
+			// Handle --wait flag - wait for completion if build is still running
+			var waitResult string
+			if waitEnabled && detail.Building {
+				ctx := cmd.Context()
+				if ctx == nil {
+					ctx = context.Background()
+				}
+
+				var err error
+				waitResult, err = waitForCompletion(ctx, client, args[0], num, waitInterval, waitTimeout)
+				if err != nil {
+					return err
+				}
+
+				// Refresh detail after wait completes
+				_, err = client.Do(client.NewRequest(), http.MethodGet, path, &detail)
+				if err != nil {
+					return err
+				}
+			}
+
+			testReport, err := shared.FetchTestReport(client, args[0], num)
+			if err != nil {
+				jklog.L().Debug().Err(err).Msg("fetch test report failed")
+			}
+
+			output := buildRunDetailOutput(args[0], detail, testReport)
+
+			// Handle --result flag
+			if resultOnly {
+				result := strings.ToUpper(output.Result)
+				if result == "" || detail.Building {
+					result = "RUNNING"
+				}
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), result)
+
+				// Apply exit-status if requested
+				if exitStatus {
+					code := exitCodeForResult(result)
+					if code != 0 {
+						return shared.NewExitError(code, "")
+					}
+				}
+				return nil
+			}
+
+			// Handle --summary flag
+			if summaryOnly {
+				return printRunSummary(cmd, output)
+			}
+
+			// Normal output
+			if err := shared.PrintOutput(cmd, output, func() error {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Run #%d (%s)\n", output.Number, output.Status)
+				if output.Result != "" {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Result: %s\n", output.Result)
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "URL: %s\n", output.URL)
+				if output.StartTime != "" {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Started: %s\n", output.StartTime)
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Duration: %s\n", shared.DurationString(output.DurationMs))
+				if output.SCM != nil && (output.SCM.Branch != "" || output.SCM.Commit != "" || output.SCM.Repo != "") {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "SCM: branch=%s commit=%s repo=%s\n", output.SCM.Branch, output.SCM.Commit, output.SCM.Repo)
+				}
+				if len(output.Parameters) > 0 {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Parameters:")
+					for _, p := range output.Parameters {
+						_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s=%s\n", p.Name, displayParameterValue(p.Value))
+					}
+				}
+				if output.Tests != nil {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Tests: total=%d failed=%d skipped=%d\n", output.Tests.Total, output.Tests.Failed, output.Tests.Skipped)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+
+			// Apply exit-status after normal output
+			if exitStatus {
+				code := exitCodeForResult(output.Result)
+				if code != 0 {
+					return shared.NewExitError(code, "")
+				}
+			}
+
+			// --wait always returns exit codes (consistent with --follow)
+			// Use waitResult from waitForCompletion when available, otherwise use output.Result
+			if waitEnabled {
+				resultToCheck := waitResult
+				if resultToCheck == "" {
+					resultToCheck = output.Result
+				}
+				code := exitCodeForResult(resultToCheck)
+				if code != 0 {
+					return shared.NewExitError(code, "")
+				}
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&resultOnly, "result", false, "Output only the build result (e.g., SUCCESS, FAILURE)")
+	cmd.Flags().BoolVar(&exitStatus, "exit-status", false, "Exit with code based on build result")
+	cmd.Flags().BoolVar(&waitEnabled, "wait", false, "Wait for build to complete (no log streaming)")
+	cmd.Flags().DurationVar(&waitInterval, "interval", 2*time.Second, "Polling interval when waiting")
+	cmd.Flags().DurationVar(&waitTimeout, "timeout", 0, "Maximum time to wait (0 = no timeout)")
+	cmd.Flags().BoolVar(&summaryOnly, "summary", false, "Show human-readable build summary")
+
+	return cmd
+}
+
+func newRunCancelCmd(f *cmdutil.Factory) *cobra.Command {
+	var mode string
+
+	cmd := &cobra.Command{
+		Use:   "cancel <jobPath> <buildNumber>",
+		Short: "Cancel a running job",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := shared.JenkinsClient(cmd, f)
+			if err != nil {
+				return err
+			}
+
+			num, err := strconv.ParseInt(args[1], 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid build number: %w", err)
+			}
+
+			action, err := resolveCancelAction(mode)
+			if err != nil {
+				return err
+			}
+
+			path := fmt.Sprintf("/%s/%d/%s", jenkins.EncodeJobPath(args[0]), num, action)
+			resp, err := client.Do(client.NewRequest(), http.MethodPost, path, nil)
+			if err != nil {
+				return err
+			}
+			if resp.StatusCode() >= 300 {
+				return fmt.Errorf("cancel failed: %s", resp.Status())
+			}
+
+			if shared.WantsJSON(cmd) || shared.WantsYAML(cmd) {
+				payload := map[string]any{
+					"jobPath": args[0],
+					"build":   num,
+					"action":  action,
+					"status":  "requested",
+				}
+				return shared.PrintOutput(cmd, payload, func() error {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Cancellation requested for %s #%d (%s)\n", args[0], num, action)
+					return nil
+				})
+			}
+
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Cancellation requested for %s #%d (%s)\n", args[0], num, action)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&mode, "mode", "stop", "Termination mode: stop, term, or kill")
+	return cmd
+}
+
+func newRunRerunCmd(f *cmdutil.Factory) *cobra.Command {
+	var follow bool
+	var interval time.Duration
+	var resultOnly bool
+	var waitEnabled bool
+	var waitInterval time.Duration
+	var waitTimeout time.Duration
+
+	cmd := &cobra.Command{
+		Use:   "rerun <jobPath> <buildNumber>",
+		Short: "Rerun a job using the previous parameters",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Validate --result requires --follow
+			if resultOnly && !follow {
+				return fmt.Errorf("--result requires --follow flag")
+			}
+			// Validate --wait and --follow are mutually exclusive
+			if waitEnabled && follow {
+				return fmt.Errorf("--wait and --follow are mutually exclusive")
+			}
+
+			client, err := shared.JenkinsClient(cmd, f)
+			if err != nil {
+				return err
+			}
+
+			num, err := strconv.ParseInt(args[1], 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid build number: %w", err)
+			}
+
+			detail, err := fetchRunDetail(client, args[0], num)
+			if err != nil {
+				return err
+			}
+
+			params := collectRerunParameters(*detail)
+			resp, err := triggerBuild(client, args[0], params)
+			if err != nil {
+				return err
+			}
+
+			if !shared.WantsJSON(cmd) && !shared.WantsYAML(cmd) && !resultOnly && !shared.WantsQuiet(cmd) {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Triggered rerun for %s #%d\n", args[0], num)
+			}
+
+			// Handle --wait flag (mutually exclusive with --follow)
+			if waitEnabled {
+				queueLocation := queueLocationFromResponse(resp)
+				buildNumber, err := waitForBuildNumber(client, queueLocation, 5*time.Minute)
+				if err != nil {
+					return err
+				}
+
+				ctx := cmd.Context()
+				if ctx == nil {
+					ctx = context.Background()
+				}
+
+				result, err := waitForCompletion(ctx, client, args[0], buildNumber, waitInterval, waitTimeout)
+				if err != nil {
+					return err
+				}
+
+				// Fetch full details for JSON/YAML/human output
+				newDetail, err := fetchRunDetail(client, args[0], buildNumber)
+				if err != nil {
+					return err
+				}
+				testReport, _ := shared.FetchTestReport(client, args[0], buildNumber)
+				output := buildRunDetailOutput(args[0], *newDetail, testReport)
+
+				if err := shared.PrintOutput(cmd, output, func() error {
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Build #%d completed: %s\n", buildNumber, result)
+					return nil
+				}); err != nil {
+					return err
+				}
+
+				// --wait always returns exit codes
+				code := exitCodeForResult(result)
+				if code != 0 {
+					return shared.NewExitError(code, "")
+				}
+				return nil
+			}
+
+			if !follow {
+				if shared.WantsJSON(cmd) || shared.WantsYAML(cmd) {
+					payload := runTriggerOutput{
+						JobPath:       args[0],
+						Message:       "rerun requested",
+						QueueLocation: queueLocationFromResponse(resp),
+					}
+					return shared.PrintOutput(cmd, payload, func() error {
+						_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Triggered rerun for %s #%d\n", args[0], num)
+						return nil
+					})
+				}
+				// In quiet mode, output just the build number.
+				// NOTE: This intentionally blocks waiting for the build number (up to 5 minutes)
+				// because the primary use case for quiet mode is scripting, where the caller
+				// needs the build number to track/poll the build status. Without blocking,
+				// we could only return the queue item URL which is less useful.
+				if shared.WantsQuiet(cmd) {
+					queueLocation := queueLocationFromResponse(resp)
+					buildNumber, err := waitForBuildNumber(client, queueLocation, 5*time.Minute)
+					if err != nil {
+						return err
+					}
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), buildNumber)
+					return nil
+				}
+				return nil
+			}
+
+			return followTriggeredRun(cmd, client, args[0], resp, interval, resultOnly)
+		},
+	}
+
+	cmd.Flags().BoolVar(&follow, "follow", false, "Follow the rerun progress until completion")
+	cmd.Flags().DurationVar(&interval, "follow-interval", 500*time.Millisecond, "Polling interval when following runs")
+	cmd.Flags().BoolVar(&resultOnly, "result", false, "Output only the final build result (requires --follow)")
+	cmd.Flags().BoolVar(&waitEnabled, "wait", false, "Wait for build to complete (no log streaming)")
+	cmd.Flags().DurationVar(&waitInterval, "interval", 2*time.Second, "Polling interval when waiting")
+	cmd.Flags().DurationVar(&waitTimeout, "timeout", 0, "Maximum time to wait (0 = no timeout)")
+	return cmd
+}
+
+// jobMetadata represents job information including its type
+type jobMetadata struct {
+	Class string         `json:"_class"`
+	Jobs  []jobListEntry `json:"jobs"`
+}
+
+// validateJobIsBuildable checks if a job can be built directly.
+// Returns an error with helpful guidance if the job is a folder or multibranch pipeline.
+func validateJobIsBuildable(client *jenkins.Client, jobPath string) error {
+	// Fetch job metadata to check its type
+	path := fmt.Sprintf("/%s/api/json", jenkins.EncodeJobPath(jobPath))
+	var metadata jobMetadata
+	resp, err := client.Do(
+		client.NewRequest().SetQueryParam("tree", "jobs[name,_class],_class"),
+		http.MethodGet,
+		path,
+		&metadata,
+	)
+	if err != nil {
+		return err
+	}
+
+	// If 404, the job doesn't exist - let triggerBuild handle it
+	if resp.StatusCode() == http.StatusNotFound {
+		return nil
+	}
+
+	// Check if it's a multibranch pipeline
+	if isMultibranchClass(metadata.Class) {
+		msg := fmt.Sprintf("'%s' is a Multibranch Pipeline and cannot be built directly", jobPath)
+		if len(metadata.Jobs) > 0 {
+			msg += "\n\nAvailable branches:"
+			for _, job := range metadata.Jobs {
+				msg += fmt.Sprintf("\n  %s/%s", jobPath, job.Name)
+			}
+			msg += fmt.Sprintf("\n\nUsage: jk run start \"%s/<branch>\"", jobPath)
+			msg += fmt.Sprintf("\nExample: jk run start \"%s/%s\"", jobPath, metadata.Jobs[0].Name)
+		}
+		return errors.New(msg)
+	}
+
+	// Check if it's a folder
+	if isFolderClass(metadata.Class) {
+		return fmt.Errorf("'%s' is a folder, not a buildable job", jobPath)
+	}
+
+	return nil
+}
+
+func triggerBuild(client *jenkins.Client, jobPath string, params map[string]string) (*resty.Response, error) {
+	if client == nil {
+		return nil, errors.New("jenkins client is required")
+	}
+
+	encoded := jenkins.EncodeJobPath(jobPath)
+	if encoded == "" {
+		return nil, errors.New("job path is required")
+	}
+
+	methodPath := fmt.Sprintf("/%s/build", encoded)
+	req := client.NewRequest()
+	if len(params) > 0 {
+		req.SetFormData(params)
+		methodPath = fmt.Sprintf("/%s/buildWithParameters", encoded)
+	}
+
+	resp, err := client.Do(req, http.MethodPost, methodPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode() >= 300 {
+		return nil, fmt.Errorf("trigger build failed: %s", resp.Status())
+	}
+	return resp, nil
+}
+
+func followTriggeredRun(cmd *cobra.Command, client *jenkins.Client, jobPath string, resp *resty.Response, interval time.Duration, resultOnly bool) error {
+	queueLocation := queueLocationFromResponse(resp)
+	buildNumber, err := waitForBuildNumber(client, queueLocation, 5*time.Minute)
+	if err != nil {
+		return err
+	}
+
+	streamLogs := !shared.WantsJSON(cmd) && !shared.WantsYAML(cmd) && !resultOnly
+	result, err := monitorRun(cmd, client, jobPath, buildNumber, interval, streamLogs)
+	if err != nil {
+		return err
+	}
+
+	// Handle --result flag: output only the result
+	if resultOnly {
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), strings.ToUpper(result))
+		code := exitCodeForResult(result)
+		if code == 0 {
+			return nil
+		}
+		return shared.NewExitError(code, "")
+	}
+
+	if shared.WantsJSON(cmd) || shared.WantsYAML(cmd) {
+		detail, err := fetchRunDetail(client, jobPath, buildNumber)
+		if err != nil {
+			return err
+		}
+		testReport, err := shared.FetchTestReport(client, jobPath, buildNumber)
+		if err != nil {
+			jklog.L().Debug().Err(err).Msg("fetch test report failed")
+		}
+		output := buildRunDetailOutput(jobPath, *detail, testReport)
+		if err := shared.PrintOutput(cmd, output, func() error {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Run #%d completed with status %s\n", output.Number, output.Result)
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	code := exitCodeForResult(result)
+	if code == 0 {
+		return nil
+	}
+	return shared.NewExitError(code, "")
+}
+
+func queueLocationFromResponse(resp *resty.Response) string {
+	if resp == nil {
+		return ""
+	}
+	location := resp.Header().Get("Location")
+	if location == "" {
+		location = resp.Header().Get("X-Queue-Item")
+	}
+	return location
+}
+
+func fetchRunDetail(client *jenkins.Client, jobPath string, buildNumber int64) (*runDetail, error) {
+	var detail runDetail
+	path := fmt.Sprintf("/%s/%d/api/json", jenkins.EncodeJobPath(jobPath), buildNumber)
+	_, err := client.Do(client.NewRequest(), http.MethodGet, path, &detail)
+	if err != nil {
+		return nil, err
+	}
+	return &detail, nil
+}
+
+func resolveCancelAction(mode string) (string, error) {
+	if mode == "" {
+		return "stop", nil
+	}
+	switch strings.ToLower(mode) {
+	case "stop":
+		return "stop", nil
+	case "term", "terminate":
+		return "term", nil
+	case "kill":
+		return "kill", nil
+	default:
+		return "", fmt.Errorf("unsupported cancel mode %q", mode)
+	}
+}
+
+// waitForBuildNumber polls the Jenkins queue until the build starts and returns
+// the build number. The timeout parameter is intentionally separate from the
+// user-specified --timeout flag - queue wait time (time to leave queue and start
+// executing) is distinct from build execution time. A build may wait in queue
+// briefly but run for hours, or vice versa.
+func waitForBuildNumber(client *jenkins.Client, queueLocation string, timeout time.Duration) (int64, error) {
+	if queueLocation == "" {
+		return 0, errors.New("follow requested but queue location unavailable")
+	}
+
+	queueAPI := strings.TrimSpace(queueLocation)
+	if !strings.Contains(queueAPI, "/api/json") {
+		queueAPI = strings.TrimSuffix(queueAPI, "/") + "/api/json"
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		var status queueItemStatus
+		_, err := client.Do(client.NewRequest(), http.MethodGet, queueAPI, &status)
+		if err != nil {
+			return 0, err
+		}
+
+		if status.Cancelled {
+			if status.Why != "" {
+				return 0, fmt.Errorf("queue item cancelled: %s", status.Why)
+			}
+			return 0, errors.New("queue item cancelled")
+		}
+
+		if status.Executable != nil && status.Executable.Number > 0 {
+			return status.Executable.Number, nil
+		}
+
+		if time.Now().After(deadline) {
+			return 0, errors.New("timed out waiting for run to start")
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func monitorRun(cmd *cobra.Command, client *jenkins.Client, jobPath string, buildNumber int64, interval time.Duration, streamLogs bool) (string, error) {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var (
+		logCtx   context.Context
+		cancel   context.CancelFunc
+		logErrCh chan error
+	)
+	if streamLogs {
+		logCtx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		logErrCh = make(chan error, 1)
+		go func() {
+			err := shared.StreamProgressiveLog(logCtx, client, jobPath, int(buildNumber), interval, cmd.OutOrStdout())
+			logErrCh <- err
+		}()
+	}
+
+	statusPath := fmt.Sprintf("/%s/%d/api/json", jenkins.EncodeJobPath(jobPath), buildNumber)
+	lastStatus := time.Time{}
+	for {
+		var detail runDetail
+		_, err := client.Do(client.NewRequest(), http.MethodGet, statusPath, &detail)
+		if err != nil {
+			if cancel != nil {
+				cancel()
+			}
+			if logErrCh != nil {
+				<-logErrCh
+			}
+			return "", err
+		}
+
+		if !detail.Building {
+			if cancel != nil {
+				cancel()
+			}
+			if logErrCh != nil {
+				if err := <-logErrCh; err != nil {
+					return "", err
+				}
+			}
+			result := strings.ToUpper(detail.Result)
+			if result == "" {
+				result = "SUCCESS"
+			}
+			if streamLogs && !shared.WantsQuiet(cmd) {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\nRun #%d completed with status %s\n", detail.Number, result)
+			}
+			return result, nil
+		}
+
+		if streamLogs && !shared.WantsQuiet(cmd) && time.Since(lastStatus) >= 5*time.Second {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Run #%d still running...\n", detail.Number)
+			lastStatus = time.Now()
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func exitCodeForResult(result string) int {
+	switch strings.ToUpper(result) {
+	case "SUCCESS":
+		return 0
+	case "UNSTABLE":
+		return 10
+	case "FAILURE":
+		return 11
+	case "ABORTED":
+		return 12
+	case "NOT_BUILT":
+		return 13
+	case "RUNNING":
+		return 14
+	default:
+		return 0
+	}
+}
+
+// waitForCompletion polls until the build completes or timeout is reached.
+// Unlike monitorRun, this does NOT stream logs - just polls for completion.
+// Returns the final build result string.
+//
+// TODO: Consider propagating context to Jenkins API calls (client.Do) for
+// proper cancellation. Currently, context is only used for the polling loop.
+func waitForCompletion(ctx context.Context, client *jenkins.Client,
+	jobPath string, buildNumber int64, interval, timeout time.Duration) (string, error) {
+
+	// Validate interval to prevent ticker panic (time.NewTicker panics on interval <= 0)
+	if interval <= 0 {
+		return "", fmt.Errorf("polling interval must be positive, got %v", interval)
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var timeoutCh <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		timeoutCh = timer.C
+	}
+
+	statusPath := fmt.Sprintf("/%s/%d/api/json", jenkins.EncodeJobPath(jobPath), buildNumber)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-timeoutCh:
+			return "", fmt.Errorf("timeout after %v waiting for build to complete", timeout)
+		case <-ticker.C:
+			var detail runDetail
+			_, err := client.Do(client.NewRequest(), http.MethodGet, statusPath, &detail)
+			if err != nil {
+				return "", fmt.Errorf("fetching build status: %w", err)
+			}
+
+			if !detail.Building {
+				result := strings.ToUpper(detail.Result)
+				if result == "" {
+					result = "UNKNOWN"
+				}
+				return result, nil
+			}
+		}
+	}
+}
+
+// resolveJobPath attempts to resolve a job path, with optional fuzzy matching and auto-search on 404
+func resolveJobPath(cmd *cobra.Command, client *jenkins.Client, jobPath string, fuzzy, interactive bool) (string, error) {
+	// First, try exact match
+	exists, err := jobExists(client, jobPath)
+	if err != nil {
+		return "", err
+	}
+	if exists {
+		return jobPath, nil
+	}
+
+	// Job not found - try auto-search with fuzzy matching
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Discover all jobs
+	allJobs, err := discoverJobs(ctx, client, "", "", maxJobDiscoveryDepth)
+	if err != nil {
+		return "", fmt.Errorf("failed to search for similar jobs: %w", err)
+	}
+
+	// Perform fuzzy search
+	fuzzyMatches := performFuzzySearch(jobPath, allJobs, 5)
+
+	if len(fuzzyMatches) == 0 {
+		return "", formatJobNotFoundError(jobPath, nil)
+	}
+
+	// If only one match and it's very similar, use it automatically (if fuzzy mode enabled)
+	if fuzzy && len(fuzzyMatches) == 1 {
+		jklog.L().Info().Msgf("Using fuzzy match: %s", fuzzyMatches[0])
+		return fuzzyMatches[0], nil
+	}
+
+	// Multiple matches - show suggestions or prompt for selection
+	if interactive && !shared.WantsJSON(cmd) && !shared.WantsYAML(cmd) {
+		selected, err := promptJobSelection(cmd, fuzzyMatches)
+		if err != nil {
+			return "", err
+		}
+		if selected != "" {
+			return selected, nil
+		}
+	}
+
+	// Non-interactive or JSON mode - return error with suggestions
+	return "", formatJobNotFoundError(jobPath, fuzzyMatches)
+}
+
+// jobExists checks if a job exists (returns false on 404, error on other failures)
+func jobExists(client *jenkins.Client, jobPath string) (bool, error) {
+	path := fmt.Sprintf("/%s/api/json", jenkins.EncodeJobPath(jobPath))
+	resp, err := client.Do(
+		client.NewRequest().SetQueryParam("tree", "_class"),
+		http.MethodGet,
+		path,
+		nil,
+	)
+	if err != nil {
+		return false, err
+	}
+
+	if resp.StatusCode() == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode() >= 400 {
+		return false, fmt.Errorf("check job existence: %s", resp.Status())
+	}
+
+	return true, nil
+}
+
+// performFuzzySearch uses the fuzzy matching package to find similar jobs
+func performFuzzySearch(query string, allJobs []string, maxResults int) []string {
+	if query == "" {
+		return nil
+	}
+
+	matches := fuzzy.Search(query, allJobs, maxResults)
+	if len(matches) > 0 {
+		return fuzzy.ExtractValues(matches)
+	}
+
+	// Fallback to lightweight substring/component matching for edge cases
+	queryLower := strings.ToLower(query)
+	queryParts := strings.Split(queryLower, "/")
+	seen := make(map[string]struct{})
+	var fallback []string
+
+	for _, job := range allJobs {
+		if len(fallback) >= maxResults && maxResults > 0 {
+			break
+		}
+
+		jobLower := strings.ToLower(job)
+		match := false
+
+		if strings.Contains(jobLower, queryLower) {
+			match = true
+		} else {
+			jobParts := strings.Split(jobLower, "/")
+			for _, qp := range queryParts {
+				qp = strings.TrimSpace(qp)
+				if qp == "" {
+					continue
+				}
+				for _, jp := range jobParts {
+					if strings.Contains(jp, qp) {
+						match = true
+						break
+					}
+				}
+				if match {
+					break
+				}
+			}
+		}
+
+		if match {
+			if _, exists := seen[job]; exists {
+				continue
+			}
+			seen[job] = struct{}{}
+			fallback = append(fallback, job)
+		}
+	}
+
+	return fallback
+}
+
+// promptJobSelection prompts the user to select from multiple job matches
+func promptJobSelection(cmd *cobra.Command, matches []string) (string, error) {
+	if len(matches) == 0 {
+		return "", errors.New("no matches to select from")
+	}
+
+	w := cmd.OutOrStdout()
+	_, _ = fmt.Fprintln(w, "\nMultiple jobs found. Please select one:")
+	for i, match := range matches {
+		_, _ = fmt.Fprintf(w, "  [%d] %s\n", i+1, match)
+	}
+	_, _ = fmt.Fprintf(w, "  [0] Cancel\n\n")
+	_, _ = fmt.Fprintf(w, "Enter selection [0-%d]: ", len(matches))
+
+	var selection int
+	_, err := fmt.Fscanln(cmd.InOrStdin(), &selection)
+	if err != nil {
+		return "", fmt.Errorf("read selection: %w", err)
+	}
+
+	if selection == 0 {
+		return "", errors.New("selection cancelled")
+	}
+	if selection < 1 || selection > len(matches) {
+		return "", fmt.Errorf("invalid selection: %d", selection)
+	}
+
+	return matches[selection-1], nil
+}
+
+// formatJobNotFoundError formats a helpful error message with suggestions
+func formatJobNotFoundError(jobPath string, suggestions []string) error {
+	if len(suggestions) == 0 {
+		return fmt.Errorf("job %q not found\n\nTry: jk search --job-glob '*%s*'", jobPath, jobPath)
+	}
+
+	msg := fmt.Sprintf("Job %q not found\n\nSuggestions:", jobPath)
+	for _, suggestion := range suggestions {
+		msg += fmt.Sprintf("\n  • %s", suggestion)
+	}
+	msg += fmt.Sprintf("\n\nTry: jk run start \"%s\"", suggestions[0])
+	msg += fmt.Sprintf("\nOr search: jk search --job-glob '*%s*'", jobPath)
+
+	return errors.New(msg)
+}

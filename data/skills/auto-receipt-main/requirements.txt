@@ -1,0 +1,6 @@
+pdf2image
+Pillow
+pandas
+openpyxl
+requests
+minio

@@ -189,7 +189,9 @@ class Indexer:
                 logger.info("Indexed batch [%d/%d] for %s", idx + 1, len(batches), rel_path)
 
     def rebuild(self, doc_dir: str, **kwargs) -> None:
-        self.store.delete([])
+        self.store.clear()
+        if self.es_client:
+            self.es_client.clear()
         if self.state_file.exists():
             self.state_file.unlink()
         self.build(doc_dir, **kwargs)

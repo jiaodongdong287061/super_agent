@@ -14,7 +14,6 @@
 
   ---
   第一步：跳转到授权中心
-
   其他项目将用户浏览器重定向到网关：
 
   http://localhost:8081/auth/oauth2/authorize?client_id=my-app&redirect_uri=http://my-app.com/callback&response_type=code

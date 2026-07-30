@@ -1,0 +1,40 @@
+# 开发/测试文件
+DEVELOPMENT_LOG.md
+PROJECT_PLAN.md
+baoxiao.py
+batch_recognize.py
+test_cases_special_fees.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+
+# 用户配置（运行时生成）
+config.json
+
+# 输出文件（运行时生成）
+output/
+images/
